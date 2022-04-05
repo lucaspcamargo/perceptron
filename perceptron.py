@@ -1,4 +1,5 @@
 import numpy as np
+import PIL
 
 IMG_W = 128
 STEPS = 1024
