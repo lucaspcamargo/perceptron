@@ -116,7 +116,7 @@ class PerceptronClassifier:
     def __str__(self):
         return f'(PerceptronClassifier: {self._p})'
 
-    def train_iteration(self):
+    def train_batch_iteration(self):
         pass
 
     def train_epoch(self, domain_dataset):
