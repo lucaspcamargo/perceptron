@@ -147,7 +147,7 @@ class PerceptronClassifier:
             for klass, perceptron in self._p.items():
                 expected = self._match_val if klass==item._class else self._not_match_val
                 input = np.concatenate((item.values, [self._bias,],))
-                output_vec = input * perceptron.weights
+                output_vec = perceptron.weights * input
                 output = self._activation(sum(output_vec))
                 err = expected - output
                 learn = err * input
@@ -172,14 +172,18 @@ class PerceptronClassifier:
             self.train_iteration((i,), etta)
  
     def train(self, domain_dataset:Dataset):
-        etta_initial = 1.0
-        etta_final = 0.0
-        num_epochs = 50000
+        etta_initial = 0.8
+        etta_final = 0.001
+        num_epochs = 1000
         for i in range(num_epochs):
             alpha = i/(num_epochs-1.0)
             delta = 1.0-alpha
-            #print(alpha, delta)
-            self.train_epoch(domain_dataset, etta_final + (etta_initial-etta_final)*delta)
+            etta_curr = etta_final + (etta_initial-etta_final)*delta
+            etta_curr = etta_curr*etta_curr
+            self.train_epoch(domain_dataset, etta_curr)
+            correct_rate = self.classify(domain_dataset)
+            print(correct_rate*100, '%   rate=',etta_curr)
+            
 
     
     def classify(self, dataset:Dataset):
@@ -193,9 +197,9 @@ class PerceptronClassifier:
             all_scores = []
             for klass, perceptron in self._p.items():
                 input = np.concatenate((item.values, [self._bias,],))
-                output_vec = input * perceptron.weights
+                output_vec = perceptron.weights * input
                 all_scores.append(self._activation(sum(output_vec)))
-            print(all_scores)
+            #print(all_scores)
             total += 1
             matches = all_scores.count(self._match_val)
             if matches == 1:
@@ -209,9 +213,10 @@ class PerceptronClassifier:
                 #print("bad")
                 nok_count += 1
 
-        print(self._p)
-        print(dataset.classes)
+        #print(self._p)
+        #print(dataset.classes)
         print(total, ok, nok_count, nok_wrong)
+        return float(ok)/total
 
 def main():
     import sys
