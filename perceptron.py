@@ -2,6 +2,8 @@
 perceptron and multilayer perceptron implementation
 Lucas Pires Camargo, 2022
 Tópicos Especiais em Sistemas Eletrônicos IV - Aprendizado de Máquina
+Programa de Pós-Graduação em Engenharia de Sistemas Eletrônicos – PPGESE
+
 
 Here are my self-imposed rules:
 - Use numpy, in preparation for more computationally-intensive algorithms. Get used to the matrix jank.
@@ -45,7 +47,7 @@ PartitioningConfig = namedtuple("PartitioningConfig", "mode training_fraction", 
 })
 
 class Dataset:
-    def __init__(self, params_filename, data_filename, partitioning_config=None):
+    def __init__(self, params_filename, data_filename, partitioning_config=PartitioningConfig()):
         self._instances = []
         with open(params_filename, 'r') as fcols:
             lines = fcols.readlines()
@@ -67,7 +69,7 @@ class Dataset:
                 instance = Instance(klass, np.array(values))
                 self._instances.append(instance)
         print(f'[dataset] {data_filename}: loaded {len(self.instances)} instances')
-        self._part = partitioning_config if partitioning_config else PartitioningConfig()
+        self._part = partitioning_config
 
     @property
     def params(self):
@@ -84,6 +86,9 @@ class Dataset:
 
     @property
     def scrambled_view(self):
+        """
+        This returns 
+        """
         ret = list(self.instances)
         shuffle(ret)
         return ret
