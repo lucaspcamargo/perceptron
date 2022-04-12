@@ -21,6 +21,7 @@ Other considerations:
 
 from enum import Enum
 from random import shuffle
+from typing import final
 import numpy as np
 from collections import namedtuple
 
@@ -55,7 +56,7 @@ class Dataset:
             assert stripped[-1] == 'class'
             self._cols = stripped[:-1]
         print(f'[dataset] {params_filename}: loaded params: {self.params}')
-        self._classes = set()
+        self._classes = list()
         num_params = len(self.params)
         with open(data_filename, 'r') as fdset:
             lines = fdset.readlines()
@@ -65,7 +66,8 @@ class Dataset:
                 values = [float(x) for x in tokens[:-1]]
                 assert len(values) == num_params
                 klass = tokens[-1]    
-                self._classes.add(klass)
+                if(klass not in self._classes):
+                    self._classes.append(klass)
                 instance = Instance(klass, np.array(values))
                 self._instances.append(instance)
         print(f'[dataset] {data_filename}: loaded {len(self.instances)} instances')
@@ -100,36 +102,116 @@ class Perceptron:
         """
         Create a Perceptron according to the dataset domain.
         """
-        self._w = np.random.random(len(domain_dataset.params))
+        # plus 1 for bias
+        wlen =len(domain_dataset.params) + 1
+        self._w = 2.0*np.random.random(wlen) - np.ones(wlen)
+        print("[perceptron] init:",self._w)
 
     @property
     def weights(self):
         return self._w
 
+    @weights.setter
+    def weights(self, wval):
+        assert(type(self._w)==type(wval))
+        self._w = wval
+
+    @property
+    def weights_T(self):
+        return np.atleast_2d(self._w).transpose()
+
     def __str__(self):
         return f'(Perceptron: {self._w})'
+
 
 
 class PerceptronClassifier:
     """
     Classification algorithm using a single perceptron per class.
-    For this to work 100%, problem must be 100% linearly separable.
+    For this to work 100%, problem must be linearly separable.
     """
     def __init__(self, domain_dataset):
-        self._p = {param: Perceptron(domain_dataset) for param in domain_dataset.params}
+        self._p = {klass: Perceptron(domain_dataset) for klass in domain_dataset.classes}
+        self._bias = 1.0
+        self._activation = lambda x: 1.0 if x>=0.0 else 0.0
+        self._match_val = self._activation(1.0)
+        self._not_match_val = self._activation(-1.0)
 
     def __str__(self):
         return f'(PerceptronClassifier: {self._p})'
 
-    def train_iteration(self):
-        pass
+    def train_iteration(self, batch, etta):
+        item: Instance
+        for item in batch:
+            # train item
+            for klass, perceptron in self._p.items():
+                expected = self._match_val if klass==item._class else self._not_match_val
+                input = np.concatenate((item.values, [self._bias,],))
+                output_vec = input * perceptron.weights
+                output = self._activation(sum(output_vec))
+                err = expected - output
+                learn = err * input
+                final_weights =  perceptron.weights + learn*etta
+                #print('--')
+                #print("values", item.values)
+                #print("weights", perceptron.weights)
+                #print("output_vec", output_vec)
+                #print("output", output)
+                #print("expected", expected)
+                #print("err", err)
+                #print("learn", learn)
+                #print("etta", etta)
+                #print("learn*etta", learn*etta)
+                #print("final_weights", final_weights)
 
-    def train_epoch(self, domain_dataset):
-        pass
+                perceptron.weights = final_weights
+
+    def train_epoch(self, domain_dataset:Dataset, etta):
+        #print('=======EPOCH======')
+        for i in domain_dataset.scrambled_view:
+            self.train_iteration((i,), etta)
  
-    def train(self):
-        pass
+    def train(self, domain_dataset:Dataset):
+        etta_initial = 1.0
+        etta_final = 0.0
+        num_epochs = 50000
+        for i in range(num_epochs):
+            alpha = i/(num_epochs-1.0)
+            delta = 1.0-alpha
+            #print(alpha, delta)
+            self.train_epoch(domain_dataset, etta_final + (etta_initial-etta_final)*delta)
 
+    
+    def classify(self, dataset:Dataset):
+        total = 0
+        ok = 0
+        nok_count = 0
+        nok_wrong = 0
+        item:Instance
+        for item in dataset.instances:
+            actual = item._class
+            all_scores = []
+            for klass, perceptron in self._p.items():
+                input = np.concatenate((item.values, [self._bias,],))
+                output_vec = input * perceptron.weights
+                all_scores.append(self._activation(sum(output_vec)))
+            print(all_scores)
+            total += 1
+            matches = all_scores.count(self._match_val)
+            if matches == 1:
+                if all_scores.index(self._match_val) == dataset.classes.index(item._class):
+                    ok += 1
+                    #print("match")
+                else:
+                    nok_wrong += 1
+                    #print("matched_wrong", all_scores.index(self._match_val), dataset.classes.index(item._class), item._class )
+            else:
+                #print("bad")
+                nok_count += 1
+
+        print(self._p)
+        print(dataset.classes)
+        print(total, ok, nok_count, nok_wrong)
 
 def main():
     import sys
@@ -138,32 +220,11 @@ def main():
     dataset = Dataset(input_params, input_data)
     classifier = PerceptronClassifier(dataset)
     print(classifier)
+
+    print("Starting training")
+    classifier.train(dataset)
+    classifier.classify(dataset)
     
 
 if __name__ == "__main__":
     main()
-
-
-""""
-w = np.zeros(IMG_W*IMG_W)
-def etta(i:int):
-    return ETTA_INITIAL
-
-def sgn(x):
-    return x #TODO
-
-def training():
-
-    for i in range(STEPS):
-
-        y[i] = sgn(w[i].transposed() * x[i])
-
-        # adaptacao de pesos:
-        w[i+1] = w[i] + etta(i) * (desired[i] - y[i]) * x[i]
-
-        # TODO: embaralhar os dados em épocas
-        
-        
-def classify():
-    pass
-"""
