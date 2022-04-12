@@ -19,11 +19,13 @@ Other considerations:
     - MNIST (for (MLP). TODO 
 """
 
+from cmath import sqrt
 from enum import Enum
 from random import shuffle
 from typing import final
 import numpy as np
 from collections import namedtuple
+from matplotlib import pyplot as plt
 
 IMG_W = 128
 STEPS = 1024
@@ -170,20 +172,38 @@ class PerceptronClassifier:
         #print('=======EPOCH======')
         for i in domain_dataset.scrambled_view:
             self.train_iteration((i,), etta)
+            break # HACK FOR SIMPLE DATASET TODO param: batch size
  
     def train(self, domain_dataset:Dataset):
-        etta_initial = 0.8
-        etta_final = 0.001
-        num_epochs = 1000
+        etta_initial = pow(0.1, 0.5)
+        etta_final = pow(0.0001, 0.5)
+        num_epochs = 2000
+
+        data_etta = []
+        data_fraction = []
+
         for i in range(num_epochs):
             alpha = i/(num_epochs-1.0)
             delta = 1.0-alpha
             etta_curr = etta_final + (etta_initial-etta_final)*delta
             etta_curr = etta_curr*etta_curr
             self.train_epoch(domain_dataset, etta_curr)
-            correct_rate = self.classify(domain_dataset)
-            print(correct_rate*100, '%   rate=',etta_curr)
-            
+            perfect, fraction = self.classify(domain_dataset)
+            print(fraction*100, '%   rate=',etta_curr)
+            data_etta.append(etta_curr)
+            data_fraction.append(fraction*100)
+            if perfect:
+                print("[perceptron_classifier] train: all classification accurate, training complete")
+                break
+        else:
+            print("[perceptron_classifier] train: no convergence")
+
+        figure, axis = plt.subplots(2)
+        axis[0].plot(range(len(data_etta)), data_etta)
+        axis[0].set_title("Etta")
+        axis[1].plot(range(len(data_fraction)), data_fraction)
+        axis[1].set_title("Fraction")
+        plt.show()
 
     
     def classify(self, dataset:Dataset):
@@ -216,7 +236,7 @@ class PerceptronClassifier:
         #print(self._p)
         #print(dataset.classes)
         print(total, ok, nok_count, nok_wrong)
-        return float(ok)/total
+        return ok==total, float(ok)/total
 
 def main():
     import sys
