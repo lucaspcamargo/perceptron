@@ -19,34 +19,42 @@ Other considerations:
     - MNIST (for (MLP). TODO 
 """
 
-from cmath import sqrt
-from enum import Enum
+from enum import Enum, unique
+from math import floor
 from random import shuffle
-from typing import final
 import numpy as np
 from collections import namedtuple
 from matplotlib import pyplot as plt
 
-IMG_W = 128
-STEPS = 1024
-ETTA_INITIAL = 1.0
-
-# teste simples com problema linearmente separavel
-# base de dados inicial: iris dataset: https://archive.ics.uci.edu/ml/datasets/iris
+PROG_NAME = 'perceptron'
+DEFAULT_TRAINING_EPOCHS_MAX = 1000 
+DEFAULT_INITIAL_ETTA = 0.1      # Desired value of etta at the beginning of the training
+DEFAULT_FINAL_ETTA = 0.00001    # Desired value of etta at the end of the training
+DEFAULT_ETTA_GAMMA = 2.2        # Control etta shape with an exponent
+DEFAULT_TRAINING_BATCH_SIZE = -1 # -1 means the entire dataset
 
 
 class Instance:
+    """
+    An object of study in a Dataset
+    """
     def __init__(self, klass, values):
         self._class = klass
         self.values = values
 
+@unique
 class PartitioningMode(Enum):
-    NO_PARTITIONING = 0,
-    TRAINING_AND_VALIDATION = 1
+    NO_PARTITIONING = 'none',
+    HOLDOUT = 'holdout'
+
+@unique
+class PartitioningContext(Enum):
+    TRAINING = 1,
+    VALIDATION = 2
 
 PartitioningConfig = namedtuple("PartitioningConfig", "mode training_fraction", defaults={
     "mode": PartitioningMode.NO_PARTITIONING,
-    'training_fraction': 0.75
+    'training_fraction': 0.8
 })
 
 class Dataset:
@@ -73,7 +81,20 @@ class Dataset:
                 instance = Instance(klass, np.array(values))
                 self._instances.append(instance)
         print(f'[dataset] {data_filename}: loaded {len(self.instances)} instances')
+        
+        # Handle instance ordering and partitioning (eg holdout)
+        shuffle(self._instances)
         self._part = partitioning_config
+        if self._part.mode == PartitioningMode.HOLDOUT:
+            validation_idx = floor(self._part.training_fraction * len(self._instances))
+            self._instances_train = self._instances[:validation_idx]
+            self._instances_validate = self._instances[validation_idx:]
+            if not self._instances_train or not self._instances_validate:
+                raise ValueError(f'[dataset] {data_filename}: not enough instances to partition! something must be wrong')
+        else:
+            # assuming no partitioning
+            print(f'[dataset] {data_filename}: not using any partitioning, beware of overfitting perhaps?')
+            self._instances_train = self._instances_validate = self._instances
 
     @property
     def params(self):
@@ -88,12 +109,18 @@ class Dataset:
     def instances(self):
         return self._instances
 
-    @property
-    def scrambled_view(self):
-        """
-        This returns 
-        """
-        ret = list(self.instances)
+    def instances_for(self, ctx:PartitioningContext = None):
+        if not ctx:
+            return self._instances
+        if ctx == PartitioningContext.VALIDATION:
+            return self._instances_validate
+        elif ctx == PartitioningContext.TRAINING:
+            return self._instances_train
+        else:
+            raise ValueError(f'[dataset] instances_for: unknown partitioning context')
+
+    def scrambled_view(self, ctx:PartitioningContext = None):
+        ret = list(self.instances_for(ctx))
         shuffle(ret)
         return ret
 
@@ -107,7 +134,7 @@ class Perceptron:
         # plus 1 for bias
         wlen =len(domain_dataset.params) + 1
         self._w = 2.0*np.random.random(wlen) - np.ones(wlen)
-        print("[perceptron] init:",self._w)
+        #print("[perceptron] init:",self._w)
 
     @property
     def weights(self):
@@ -170,26 +197,26 @@ class PerceptronClassifier:
 
     def train_epoch(self, domain_dataset:Dataset, etta):
         #print('=======EPOCH======')
-        for i in domain_dataset.scrambled_view:
+        for i in domain_dataset.scrambled_view(PartitioningContext.TRAINING):
             self.train_iteration((i,), etta)
-            break # HACK FOR SIMPLE DATASET TODO param: batch size
+            #break # HACK FOR SIMPLE DATASET TODO param: batch size
  
     def train(self, domain_dataset:Dataset):
-        etta_initial = pow(0.1, 0.5)
-        etta_final = pow(0.0001, 0.5)
-        num_epochs = 2000
+        etta_gamma = DEFAULT_ETTA_GAMMA
+        etta_initial = pow(DEFAULT_INITIAL_ETTA, 1.0/etta_gamma)
+        etta_final = pow(DEFAULT_FINAL_ETTA, 1.0/etta_gamma)
+        max_epochs = DEFAULT_TRAINING_EPOCHS_MAX
 
         data_etta = []
         data_fraction = []
 
-        for i in range(num_epochs):
-            alpha = i/(num_epochs-1.0)
-            delta = 1.0-alpha
-            etta_curr = etta_final + (etta_initial-etta_final)*delta
-            etta_curr = etta_curr*etta_curr
+        for i in range(max_epochs):
+            alpha = i/(max_epochs-1.0) # zero to one
+            delta = 1.0-alpha # one to zero
+            etta_curr = pow(etta_final + (etta_initial-etta_final)*delta, etta_gamma)
             self.train_epoch(domain_dataset, etta_curr)
-            perfect, fraction = self.classify(domain_dataset)
-            print(fraction*100, '%   rate=',etta_curr)
+            perfect, fraction = self.classify(domain_dataset, PartitioningContext.VALIDATION)
+            #print(fraction*100, '%   rate=',etta_curr)
             data_etta.append(etta_curr)
             data_fraction.append(fraction*100)
             if perfect:
@@ -206,20 +233,19 @@ class PerceptronClassifier:
         plt.show()
 
     
-    def classify(self, dataset:Dataset):
+    def classify(self, dataset:Dataset, ctx:PartitioningContext=None):
         total = 0
         ok = 0
         nok_count = 0
         nok_wrong = 0
         item:Instance
-        for item in dataset.instances:
+        for item in dataset.instances_for(ctx):
             actual = item._class
             all_scores = []
             for klass, perceptron in self._p.items():
                 input = np.concatenate((item.values, [self._bias,],))
                 output_vec = perceptron.weights * input
                 all_scores.append(self._activation(sum(output_vec)))
-            #print(all_scores)
             total += 1
             matches = all_scores.count(self._match_val)
             if matches == 1:
@@ -233,12 +259,25 @@ class PerceptronClassifier:
                 #print("bad")
                 nok_count += 1
 
-        #print(self._p)
-        #print(dataset.classes)
-        print(total, ok, nok_count, nok_wrong)
         return ok==total, float(ok)/total
 
+
+def get_arg_parser():
+    import argparse
+    parser = argparse.ArgumentParser(PROG_NAME)
+    parser.add_argument('parser_name', help='id of the parser to use', type=str, nargs=1)
+    parser.add_argument('dataset_dir', help='folder containing the dataset to use', type=str, nargs=1)
+    parser.add_argument('dataset_info', help='name of the dataset in the folder, or additional dataset parser params', nargs="*", type=str)
+
+    parser.add_argument('--max-epochs', '-e', help='maximum number of training epochs', nargs=1, type=int)
+    parser.add_argument('--batch-size', '-b', help='number of epoch instances to train in a batch', nargs=1, type=int)
+    return parser
+
 def main():
+    parser = get_arg_parser()
+    args = parser.parse_args()
+    print(args)
+
     import sys
     input_params = sys.argv[1]
     input_data = sys.argv[2]
@@ -248,7 +287,7 @@ def main():
 
     print("Starting training")
     classifier.train(dataset)
-    classifier.classify(dataset)
+    classifier.classify(dataset._instances_validate)
     
 
 if __name__ == "__main__":
