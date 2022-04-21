@@ -19,6 +19,7 @@ Other considerations:
     - MNIST (for (MLP). TODO 
 """
 
+from abc import ABC
 from enum import Enum, unique
 from math import floor
 from random import shuffle
@@ -57,18 +58,32 @@ PartitioningConfig = namedtuple("PartitioningConfig", "mode training_fraction", 
     'training_fraction': 0.8
 })
 
-class Dataset:
-    def __init__(self, params_filename, data_filename, partitioning_config=PartitioningConfig()):
-        self._instances = []
-        with open(params_filename, 'r') as fcols:
+class DatasetSource(ABC):
+
+    def read(self):
+        """Returns two things, a list of instances and class names"""
+        raise NotImplementedError()
+
+    def __str__(self):
+        raise NotImplementedError()
+
+class IrisDatasetSource(DatasetSource):
+
+    def __init__(self, params_filename, data_filename):
+        self.params_filename = params_filename
+        self.data_filename = data_filename
+
+    def read(self):
+        _instances = []
+        with open(self.params_filename, 'r') as fcols:
             lines = fcols.readlines()
             stripped = [x.strip() for x in lines if x.strip()]
             assert stripped[-1] == 'class'
-            self._cols = stripped[:-1]
-        print(f'[dataset] {params_filename}: loaded params: {self.params}')
-        self._classes = list()
-        num_params = len(self.params)
-        with open(data_filename, 'r') as fdset:
+            _cols = stripped[:-1]
+        print(f'[dataset] {self.params_filename}: loaded params: {_cols}')
+        _classes = list()
+        num_params = len(_cols)
+        with open(self.data_filename, 'r') as fdset:
             lines = fdset.readlines()
             stripped = [x.strip() for x in lines if x.strip()]
             for line in stripped:
@@ -76,11 +91,21 @@ class Dataset:
                 values = [float(x) for x in tokens[:-1]]
                 assert len(values) == num_params
                 klass = tokens[-1]    
-                if(klass not in self._classes):
-                    self._classes.append(klass)
+                if(klass not in _classes):
+                    _classes.append(klass)
                 instance = Instance(klass, np.array(values))
-                self._instances.append(instance)
-        print(f'[dataset] {data_filename}: loaded {len(self.instances)} instances')
+                _instances.append(instance)
+        print(f'[dataset] {self.data_filename}: loaded {len(_instances)} instances')
+        return _cols, _instances, _classes
+
+    def __str__(self):
+        return f'IrisDatasetSource("{self.params_filename}","{self.data_filename}")'
+
+class Dataset:
+    def __init__(self, source, partitioning_config=PartitioningConfig()):
+        
+        self._source = source
+        self._cols, self._instances, self._classes = source.read()
         
         # Handle instance ordering and partitioning (eg holdout)
         shuffle(self._instances)
@@ -90,10 +115,10 @@ class Dataset:
             self._instances_train = self._instances[:validation_idx]
             self._instances_validate = self._instances[validation_idx:]
             if not self._instances_train or not self._instances_validate:
-                raise ValueError(f'[dataset] {data_filename}: not enough instances to partition! something must be wrong')
+                raise ValueError(f'[dataset] {self._source}: not enough instances to partition! something must be wrong')
         else:
             # assuming no partitioning
-            print(f'[dataset] {data_filename}: not using any partitioning, beware of overfitting perhaps?')
+            print(f'[dataset] {self._source}: not using any partitioning, beware of overfitting perhaps?')
             self._instances_train = self._instances_validate = self._instances
 
     @property
@@ -280,7 +305,8 @@ def main():
     import sys
     input_params = sys.argv[1]
     input_data = sys.argv[2]
-    dataset = Dataset(input_params, input_data)
+    datasource = IrisDatasetSource(input_params, input_data)
+    dataset = Dataset(datasource)
     classifier = PerceptronClassifier(dataset)
     print(classifier)
 
