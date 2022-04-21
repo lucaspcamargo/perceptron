@@ -15,33 +15,37 @@ People crap all over OO these days, but considering the above, we are doing this
 
 Other considerations:
 - We are able to use the following datasets:
-    - iris (for P);
+    - iris;
+    - moodle;
     - MNIST (for (MLP). TODO 
 """
 
 from abc import ABC
+import argparse
 from enum import Enum, unique
 from math import floor
 from random import shuffle
 import numpy as np
 from collections import namedtuple
 from matplotlib import pyplot as plt
+from PIL import Image
+
+
+##################################################################################################
+# DEFAULTS
 
 PROG_NAME = 'perceptron'
-DEFAULT_TRAINING_EPOCHS_MAX = 1000 
-DEFAULT_INITIAL_ETTA = 0.1      # Desired value of etta at the beginning of the training
-DEFAULT_FINAL_ETTA = 0.00001    # Desired value of etta at the end of the training
-DEFAULT_ETTA_GAMMA = 2.2        # Control etta shape with an exponent
+DEFAULT_TRAINING_EPOCHS_MAX = 100 
+DEFAULT_INITIAL_ETTA = 0.01      # Desired value of etta at the beginning of the training
+DEFAULT_FINAL_ETTA = DEFAULT_INITIAL_ETTA/100     # Desired value of etta at the end of the training
+DEFAULT_ETTA_GAMMA = 2.2         # Control etta shape with an exponent
 DEFAULT_TRAINING_BATCH_SIZE = -1 # -1 means the entire dataset
+# DEBUG_FLAGS
+DUMP_ITERATION = False
 
 
-class Instance:
-    """
-    An object of study in a Dataset
-    """
-    def __init__(self, klass, values):
-        self._class = klass
-        self.values = values
+##################################################################################################
+# DEFINITIONS
 
 @unique
 class PartitioningMode(Enum):
@@ -57,6 +61,9 @@ PartitioningConfig = namedtuple("PartitioningConfig", "mode training_fraction", 
     "mode": PartitioningMode.NO_PARTITIONING,
     'training_fraction': 0.8
 })
+
+##################################################################################################
+# DATASET SOURCES
 
 class DatasetSource(ABC):
 
@@ -101,11 +108,111 @@ class IrisDatasetSource(DatasetSource):
     def __str__(self):
         return f'IrisDatasetSource("{self.params_filename}","{self.data_filename}")'
 
+class MoodleDatasetSource(DatasetSource):
+    def __init__(self, filename, *flags) -> None:
+        super().__init__()
+        self.filename = filename
+        self.flags = flags
+
+    def read(self):
+        instances = []
+        dump = "dump" in self.flags
+
+        with open(self.filename, 'r') as f:
+            lines = f.readlines()
+            stripped = [x.strip() for x in lines if x.strip()]
+            idx = 0
+            for line in stripped:
+                tokens = line.split(',')
+                klass = str(tokens[0])
+                values = [float(x) for x in tokens[1:]]
+                instance = Instance(klass, np.array(values))
+                instances.append(instance)
+                idx += 1
+                if dump:
+                    valuesi = [int(x) for x in tokens[1:]]
+                    reshaped = np.array(valuesi).reshape(8,8)
+                    as_bytes = (255*reshaped).astype(np.uint8)
+                    im:Image.Image = Image.fromarray(as_bytes, 'L')
+                    im.save(f"./{idx}.png")
+
+        params = [f'p{x}' for x in range(64)]
+        classes = [str(x) for x in range(10)]
+        print(params)
+        print(classes)
+        return params, instances, classes
+
+    def __str__(self):
+        return f'MoodleDatasetSource("{self.filename}")'
+
+class MNISTDatasetSource(DatasetSource):
+    def __init__(self, fname_labels, fname_images, *flags):
+        self.fname_labels = fname_labels
+        self.fname_images = fname_images
+        self.flags = flags
+
+    def read(self):
+        dump = "dump" in self.flags
+        instances = []
+
+        with open(self.fname_labels, 'rb') as flbl:
+            magic = flbl.read(4)
+            assert magic==b'\0\0\x08\x01'
+            countbytes = flbl.read(4)
+            count = int.from_bytes(countbytes, byteorder='big')
+            labels = [int(b) for b in flbl.read(count)]
+
+        with open(self.fname_images, 'rb') as flbl:
+            header = flbl.read(4*4)
+            magic = header[0:4]
+            assert magic==b'\0\0\x08\x03'
+            count = int.from_bytes(header[4:8], byteorder='big')
+            rows = int.from_bytes(header[8:12], byteorder='big')
+            cols = int.from_bytes(header[12:16], byteorder='big')
+            print(f"[mnist] importing {count} images with {rows}x{cols} pixels each")
+            imsz = rows*cols
+            for i in range(count):
+                pixels = flbl.read(imsz)
+                instance_data = np.frombuffer(pixels, dtype=np.uint8).astype(float)/255.0
+                inst = Instance(labels[i], instance_data)
+                instances.append(inst)
+                if dump:
+                    valuesi = np.frombuffer(pixels, dtype=np.uint8)
+                    reshaped = np.array(valuesi).reshape(rows,cols)
+                    im:Image.Image = Image.fromarray(reshaped, 'L')
+                    im.save(f"./{i}.png")
+
+        params = [f'p{x}' for x in range(imsz)]
+        classes = list(set(labels))
+        return params, instances, classes
+
+    def __str__(self):
+        return f'MoodleDatasetSource("{self.fname_images}","{self.fname_labels}")'
+
+##################################################################################################
+# MODELS
+
+
+class Instance:
+    """
+    An object of study in a Dataset
+    """
+    def __init__(self, klass, values):
+        self._class = klass
+        self.values = values
+
 class Dataset:
     def __init__(self, source, partitioning_config=PartitioningConfig()):
         
         self._source = source
         self._cols, self._instances, self._classes = source.read()
+
+        if not self._cols:
+            raise ValueError("Dataset source has no parameter ids!")
+        if not self._instances:
+            raise ValueError("Dataset source has no instances!")
+        if not self._classes:
+            raise ValueError("Dataset source has no classes!")
         
         # Handle instance ordering and partitioning (eg holdout)
         shuffle(self._instances)
@@ -149,6 +256,9 @@ class Dataset:
         return ret
 
 
+##################################################################################################
+# CLASSIFIERS
+
 class Perceptron:
 
     def __init__(self, domain_dataset):
@@ -191,7 +301,7 @@ class PerceptronClassifier:
         self._not_match_val = self._activation(-1.0)
 
     def __str__(self):
-        return f'(PerceptronClassifier: {self._p})'
+        return f'(PerceptronClassifier: {len(self._p)} perceptrons/classes)'
 
     def train_iteration(self, batch, etta):
         item: Instance
@@ -205,27 +315,28 @@ class PerceptronClassifier:
                 err = expected - output
                 learn = err * input
                 final_weights =  perceptron.weights + learn*etta
-                #print('--')
-                #print("values", item.values)
-                #print("weights", perceptron.weights)
-                #print("output_vec", output_vec)
-                #print("output", output)
-                #print("expected", expected)
-                #print("err", err)
-                #print("learn", learn)
-                #print("etta", etta)
-                #print("learn*etta", learn*etta)
-                #print("final_weights", final_weights)
+                if DUMP_ITERATION:
+                    print('--')
+                    print("values", item.values)
+                    print("weights", perceptron.weights)
+                    print("output_vec", output_vec)
+                    print("output", output)
+                    print("expected", expected)
+                    print("err", err)
+                    print("learn", learn)
+                    print("etta", etta)
+                    print("learn*etta", learn*etta)
+                    print("final_weights", final_weights)
 
                 perceptron.weights = final_weights
 
     def train_epoch(self, domain_dataset:Dataset, etta):
-        #print('=======EPOCH======')
+        print('=======EPOCH======')
         for i in domain_dataset.scrambled_view(PartitioningContext.TRAINING):
             self.train_iteration((i,), etta)
             #break # HACK FOR SIMPLE DATASET TODO param: batch size
  
-    def train(self, domain_dataset:Dataset):
+    def train(self, domain_dataset:Dataset, args:argparse.Namespace):
         etta_gamma = DEFAULT_ETTA_GAMMA
         etta_initial = pow(DEFAULT_INITIAL_ETTA, 1.0/etta_gamma)
         etta_final = pow(DEFAULT_FINAL_ETTA, 1.0/etta_gamma)
@@ -235,16 +346,20 @@ class PerceptronClassifier:
         data_fraction = []
 
         for i in range(max_epochs):
-            alpha = i/(max_epochs-1.0) # zero to one
-            delta = 1.0-alpha # one to zero
-            etta_curr = pow(etta_final + (etta_initial-etta_final)*delta, etta_gamma)
-            self.train_epoch(domain_dataset, etta_curr)
-            perfect, fraction = self.classify(domain_dataset, PartitioningContext.VALIDATION)
-            #print(fraction*100, '%   rate=',etta_curr)
-            data_etta.append(etta_curr)
-            data_fraction.append(fraction*100)
-            if perfect:
-                print("[perceptron_classifier] train: all classification accurate, training complete")
+            try:
+                alpha = i/(max_epochs-1.0) # zero to one
+                delta = 1.0-alpha # one to zero
+                etta_curr = pow(etta_final + (etta_initial-etta_final)*delta, etta_gamma)
+                self.train_epoch(domain_dataset, etta_curr)
+                perfect, fraction = self.classify(domain_dataset, PartitioningContext.VALIDATION)
+                #print(fraction*100, '%   rate=',etta_curr)
+                data_etta.append(etta_curr)
+                data_fraction.append(fraction*100)
+                if perfect:
+                    print("[perceptron_classifier] train: all classification accurate, training complete")
+                    break
+            except KeyboardInterrupt:
+                print("[perceptron_classifier] training interrupted")
                 break
         else:
             print("[perceptron_classifier] train: no convergence")
@@ -286,33 +401,43 @@ class PerceptronClassifier:
         return ok==total, float(ok)/total
 
 
-def get_arg_parser():
-    import argparse
-    parser = argparse.ArgumentParser(PROG_NAME)
-    parser.add_argument('parser_name', help='id of the parser to use', type=str, nargs=1)
-    parser.add_argument('dataset_dir', help='folder containing the dataset to use', type=str, nargs=1)
-    parser.add_argument('dataset_info', help='name of the dataset in the folder, or additional dataset parser params', nargs="*", type=str)
+##################################################################################################
+# TOOL
 
-    parser.add_argument('--max-epochs', '-e', help='maximum number of training epochs', nargs=1, type=int)
-    parser.add_argument('--batch-size', '-b', help='number of epoch instances to train in a batch', nargs=1, type=int)
+def get_arg_parser():
+    parser = argparse.ArgumentParser(PROG_NAME)
+    parser.add_argument('parser_name', help='id of the parser to use', type=str, nargs='?')
+    parser.add_argument('dataset_info', help='required dataset filenames, or additional dataset parser parameters', nargs="*", type=str)
+
+    parser.add_argument('--max-epochs', '-e', help='maximum number of training epochs', nargs=1, type=int, default=DEFAULT_TRAINING_EPOCHS_MAX)
+    parser.add_argument('--batch-size', '-b', help='number of epoch instances to train in a batch', nargs=1, type=int, default=DEFAULT_TRAINING_BATCH_SIZE)
     return parser
+
+def get_datasource(args):
+    if args.parser_name == "iris":
+        return IrisDatasetSource(*args.dataset_info)
+    if args.parser_name == "moodle":
+        return MoodleDatasetSource(*args.dataset_info)
+    if args.parser_name == "mnist":
+        return MNISTDatasetSource(*args.dataset_info)
+    else:
+        raise ValueError(f"unknown parser: {args.parser_name}")
 
 def main():
     parser = get_arg_parser()
     args = parser.parse_args()
     print(args)
 
-    import sys
-    input_params = sys.argv[1]
-    input_data = sys.argv[2]
-    datasource = IrisDatasetSource(input_params, input_data)
+    #datasource = IrisDatasetSource("iris/params", "iris/iris.data")
+    #datasource = MoodleDatasetSource("moodle/data.csv")
+    datasource = get_datasource(args)
     dataset = Dataset(datasource)
     classifier = PerceptronClassifier(dataset)
     print(classifier)
 
     print("Starting training")
-    classifier.train(dataset)
-    classifier.classify(dataset._instances_validate)
+    classifier.train(dataset, args)
+    #classifier.classify(dataset, PartitioningContext.VALIDATION)
     
 
 if __name__ == "__main__":
