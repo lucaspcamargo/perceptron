@@ -4,16 +4,28 @@ Lucas Pires Camargo, 2022
 Tópicos Especiais em Sistemas Eletrônicos IV - Aprendizado de Máquina
 Programa de Pós-Graduação em Engenharia de Sistemas Eletrônicos – PPGESE
 
+- This tool implements Perceptron and Multi-Layer Perceptron classifiers,
+in a variety of configurations.
 
-Here are my self-imposed rules:
-- Use numpy, in preparation for more computationally-intensive algorithms. Get used to the matrix jank.
-- Performance is nice to have, but legibility is paramount.
-- Terseness is neither encouraged nor frowned upon. But if the intent is not clear, I lose.
-- Performance may suck or not. I want to use batched training, so that I can parallelize this
-  with understandable semantics, and bring my Ryzen to its knees. We'll see.
-People crap all over OO these days, but considering the above, we are doing this with classes. Fight me.
+- TODO list:
+    - Numpy aready takes care of paralellization if you use the matrices right.
+      Use it instead of mp.Pool. For that:
+        - Consolidate dataset on a single matrix (add "bias" parameter automatically, set as one);
+        - Consolidate all perceptrons of a layer on a single matrix (add "bias" random weight automatically);
+        - Calculate the weighted inputs to all perceptrons on a layer at once, and then sum them up for every perceptron;
+        - Apply activation function for the entire result using numpy stuff.
+        - Calculate error using numpy.
+        - By this point, you know.
+    - Do MLP right the first time, taking advantage of the above;
+    - Support different operations (with argparser subcommands maybe);
+        - Classifier training and network save to file;
+        - Classifier load from file and classify dataset;
+    - Figure out what to do with partitioning;
+    - Take a look at mROC;
+    - Allow storage of arbitrary per-epoch and per-batch stats, and plotting them;
+    - Allow doing multiple training runs by varying the training parameters, and plotting them as multiple lines on the same graph for comparison;
+    - BONUS: small UI tool that lets the user load/draw image to feed the neural network with, and see the outputs and some data.
 
-Other considerations:
 - We are able to use the following datasets:
     - synthetic, linearly-separable (mine);
     - iris;
@@ -54,6 +66,14 @@ DUMP_ITERATION = False
 
 ##################################################################################################
 # DEFINITIONS
+
+SMP_ENV_VARS = [
+    "OMP_ENV_VARS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+]
 
 @unique
 class PartitioningMode(Enum):
@@ -299,6 +319,38 @@ class Perceptron:
         return f'(Perceptron: {self._w})'
 
 
+class PerceptronLayer:
+
+    def __init__(self, pcount, icount):
+        """
+        Create a Perceptron layer according to the dataset domain.
+        Params:
+            - pcount: number of perceptrons in the layer
+            - icount: number of inputs for every perceptron (e.g. number of dataset parameters + 1 for the bias)
+        """
+        # plus 1 for bias
+        assert(pcount)
+        wlen = len(icount)
+        self._w = 2.0*np.random.random((pcount, wlen,)) - np.ones((pcount, wlen,))
+        print(f"[perceptron_layer] init: {wlen-1}+1 weights for {pcount} perceptrons",self._w)
+
+    @property
+    def weights(self):
+        return self._w
+
+    @weights.setter
+    def weights(self, wval):
+        assert(type(self._w)==type(wval))
+        self._w = wval
+
+    @property
+    def weights_T(self):
+        return np.atleast_2d(self._w).transpose()
+
+    def __str__(self):
+        return f'(Perceptron: {self._w})'
+
+
 
 class PerceptronClassifier:
     """
@@ -454,8 +506,8 @@ class PerceptronClassifier:
                     target = self._p[k]
                     assert final_weights.shape == target.weights.shape
                     target.weights = final_weights
-                    
-        print(size, errors, fraction)
+
+        #print(size, errors, fraction)
         size_total = float(sum(size))
         return sum([a*b for a,b in zip(size, errors)])/size_total,\
                sum([a*b for a,b in zip(size, fraction)])/size_total
@@ -477,7 +529,7 @@ class PerceptronClassifier:
                 alpha = i/(max_epochs-1.0) # zero to one
                 delta = 1.0-alpha # one to zero
                 etta_curr = pow(etta_final + (etta_initial-etta_final)*delta, etta_gamma)
-                error, fraction = (self.train_epoch if args.num_procs == 1 else self.train_epoch_mp)(domain_dataset, etta_curr, args, i==0)
+                error, fraction = (self.train_epoch if args.num_procs == 1 else self.train_epoch_mp)(domain_dataset, etta_curr, args, i==0 and not args.skip_dry_run)
                 print(f"Epoch #{i}: err={error}, fraction={fraction}, rate={etta_curr}")
                 data_etta.append(etta_curr)
                 data_error.append(error)
@@ -493,8 +545,8 @@ class PerceptronClassifier:
                         plt.pause(0.05)
                     except KeyboardInterrupt:
                         raise
-                if error < error_threshold:
-                    print(f"[perceptron_classifier] train: error threshold met ({error} < {error_threshold})")
+                if error <= error_threshold:
+                    print(f"[perceptron_classifier] train: error threshold met ({error} <= {error_threshold})")
                     break
             except KeyboardInterrupt:
                 print("[perceptron_classifier] training interrupted")
@@ -534,6 +586,28 @@ class PerceptronClassifier:
         return ok==total, float(ok)/total
 
 
+
+class MLPClassifier:
+
+    def __init__(self, domain_dataset):
+        self._p = {klass: Perceptron(domain_dataset) for klass in domain_dataset.classes}
+        self._bias = 1.0
+        self._activation = lambda x: 1.0 if x>=0.0 else 0.0  # TODO these values are literals in MP code
+        self._match_val = self._activation(1.0)
+        self._not_match_val = self._activation(-1.0)
+
+    def _config_threads(self, args):
+        import os
+        if args.num_procs != -1:
+            numstr = str(args.num_procs)
+            for envvar in SMP_ENV_VARS:
+                os.environ[envvar] = numstr
+            
+
+
+
+
+
 ##################################################################################################
 # DATA COLLECTION
 
@@ -552,6 +626,7 @@ def get_arg_parser():
     parser.add_argument('--batch-size', '-b', help='number of epoch instances to train in a batch', nargs='?', type=int, default=DEFAULT_TRAINING_BATCH_SIZE)
     parser.add_argument('--num-procs', '-j', help='number of processes used for training', nargs='?', type=int, default=DEFAULT_TRAINING_NUM_PROCS)
     parser.add_argument('--error-threshold', '-t', help='Error level to consider convergence', nargs='?', type=float, default=DEFAULT_ERROR_THRESHOLD)
+    parser.add_argument('--skip-dry-run', '-s', help='Skip making epoch #0 a dry-run', action='store_true')
     return parser
 
 def get_datasource(args):
