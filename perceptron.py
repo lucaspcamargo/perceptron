@@ -15,20 +15,26 @@ People crap all over OO these days, but considering the above, we are doing this
 
 Other considerations:
 - We are able to use the following datasets:
+    - synthetic, linearly-separable (mine);
     - iris;
-    - moodle;
-    - MNIST (for (MLP). TODO 
+    - simplified handwritten digit dataset, from moodle;
+    - MNIST.
 """
 
+# deps
+import numpy as np
+from matplotlib import pyplot as plt
+
+# std
 from abc import ABC
 import argparse
 from enum import Enum, unique
 from math import floor
+from os import getpid
 from random import shuffle
-import numpy as np
 from collections import namedtuple
-from matplotlib import pyplot as plt
 from PIL import Image
+import multiprocessing as mp
 
 
 ##################################################################################################
@@ -41,6 +47,7 @@ DEFAULT_FINAL_ETTA = DEFAULT_INITIAL_ETTA     # Desired value of etta at the end
 DEFAULT_ETTA_GAMMA = 2.2         # Control etta shape with an exponent
 DEFAULT_TRAINING_BATCH_SIZE = -1 # -1 means the entire dataset
 DEFAULT_ERROR_THRESHOLD = 0.001
+DEFAULT_TRAINING_NUM_PROCS = 1
 # DEBUG_FLAGS
 DUMP_ITERATION = False
 
@@ -301,14 +308,14 @@ class PerceptronClassifier:
     def __init__(self, domain_dataset):
         self._p = {klass: Perceptron(domain_dataset) for klass in domain_dataset.classes}
         self._bias = 1.0
-        self._activation = lambda x: 1.0 if x>=0.0 else 0.0
+        self._activation = lambda x: 1.0 if x>=0.0 else 0.0  # TODO these values are literals in MP code
         self._match_val = self._activation(1.0)
         self._not_match_val = self._activation(-1.0)
 
     def __str__(self):
         return f'(PerceptronClassifier: {len(self._p)} perceptrons/classes)'
 
-    def train_batch(self, batch, etta):
+    def train_batch(self, batch, etta, dry_run):
         item: Instance        
         errors = []
         fraction = []
@@ -335,33 +342,125 @@ class PerceptronClassifier:
                     print("learn*etta", learn*etta)
                     print("final_weights", final_weights)
 
-                perceptron.weights = final_weights
+                if not dry_run:
+                    perceptron.weights = final_weights
                 errors.append(err*err)
                 fraction.append(0 if output!=expected else 1)
         return np.average(errors), np.average(fraction)
 
-    def train_epoch(self, domain_dataset:Dataset, etta, args:argparse.Namespace):
+
+    def train_batch_static(perceptrons, batch, etta, dry_run):
+        item: Instance        
+        errors = []
+        fraction = []
+        for item in batch:
+            # train item
+            for klass, perceptron in perceptrons.items():
+                expected = 1.0 if klass==item._class else 0.0
+                input = np.concatenate((item.values, [1.0,],)) # TODO simplify this, put a bias with all values automatically
+                output_vec = perceptron.weights * input
+                output = 1.0 if (sum(output_vec)) >= 0.0 else 0.0
+                err = expected - output
+                learn = err * input
+                final_weights =  perceptron.weights + learn*etta
+                if not dry_run:
+                    perceptron.weights = final_weights
+                errors.append(err*err)
+                fraction.append(0 if output!=expected else 1)
+        return np.average(errors), np.average(fraction)
+
+
+    def train_epoch(self, domain_dataset:Dataset, etta, args:argparse.Namespace, dry_run):
 
         source = domain_dataset.scrambled_view(PartitioningContext.TRAINING)
         # split the source in sets of "x" batches
         batches = [source[x:x+args.batch_size] for x in range(0, len(source), args.batch_size)] if args.batch_size != -1 else [source]
         
-        # TODO fork or something of the sort?
         size = []
         errors = []
         fraction = []
 
-        #process a batch
+        #process all batches one after the other
         for i, b in enumerate(batches):
-            err, frac = self.train_batch(b, etta)
+            if True: # use static func for single-thread too
+                err, frac = PerceptronClassifier.train_batch_static(self._p, b, etta, dry_run)
+            else:
+                err, frac = self.train_batch(b, etta, dry_run)
             size.append(len(b))
             errors.append(err)
             fraction.append(frac)
             print(f"Batch #{i}: err={err}, fraction={frac}")
-        print(size, errors, fraction)
+        #print(size, errors, fraction) 
         return np.average(sum([a*b for a,b in zip(size, errors)])/sum(size)),\
                np.average(sum([a*b for a,b in zip(size, fraction)])/sum(size))
  
+
+    @staticmethod
+    def train_batch_mp_main(work):
+        perceptrons = work[0]
+        batch = work[1]
+        etta = work[2]
+        dry_run = work[3]
+        #print(f"train_batch_mp_main, pid={getpid()}")
+        errs, frac = PerceptronClassifier.train_batch_static(perceptrons, batch, etta, dry_run)
+        return len(batch), list(map(lambda k: (k, list(perceptrons[k].weights)), perceptrons.keys())), (errs, frac,)
+
+    def train_epoch_mp(self, domain_dataset:Dataset, etta, args:argparse.Namespace, dry_run):
+        source = domain_dataset.scrambled_view(PartitioningContext.TRAINING)
+        # split the source in sets of "x" batches
+        batches = [source[x:x+args.batch_size] for x in range(0, len(source), args.batch_size)] if args.batch_size != -1 else [source]
+        
+        size = []
+        errors = []
+        fraction = []
+
+        num_procs = args.num_procs
+        collected = 0
+        while batches:
+            slice = batches[:num_procs]
+            batches = batches[num_procs:]
+            pool = mp.Pool(num_procs)
+            results = pool.map(PerceptronClassifier.train_batch_mp_main, [(self._p, batch, etta, dry_run) for batch in slice]) # THIS WILL NEVER WORK
+            #print("MP RESULTS::: " + print(results))
+
+            size_accum = 0
+            weight_accum = {}
+
+            #process batches in slice
+            for i, bres in enumerate(results):
+                batch_size = bres[0]
+                new_weights = {k:v for k,v in bres[1]}
+                err, frac = bres[2]
+                print(f"Batch #{collected}: sz={batch_size}, err={err}, fraction={frac} (collecting)")
+                # for every perceptron, accumulate the weights, weighted by this batches' size
+                for k in new_weights:
+                    weighted_weights = float(batch_size)*np.array(new_weights[k])
+                    weight_accum[k] = weighted_weights if i==0 else (weight_accum[k]+weighted_weights)
+                #print(bres)
+                #print(new_weights[0])
+                size.append(batch_size)
+                size_accum += batch_size
+                errors.append(err)
+                fraction.append(frac)
+                collected += 1
+
+            # at this point, we got all results from current slice
+            assert size_accum == sum(map(len,slice))
+
+            # for every perceptron, update weights
+            for k in self._p:
+                final_weights = (1.0/float(size_accum)) * weight_accum[k]
+                if not dry_run:
+                    target = self._p[k]
+                    assert final_weights.shape == target.weights.shape
+                    target.weights = final_weights
+                    
+        print(size, errors, fraction)
+        size_total = float(sum(size))
+        return sum([a*b for a,b in zip(size, errors)])/size_total,\
+               sum([a*b for a,b in zip(size, fraction)])/size_total
+
+
     def train(self, domain_dataset:Dataset, args:argparse.Namespace):
         etta_gamma = DEFAULT_ETTA_GAMMA
         etta_initial = pow(DEFAULT_INITIAL_ETTA, 1.0/etta_gamma)
@@ -372,25 +471,23 @@ class PerceptronClassifier:
         data_etta = []
         data_error = []
         fig, axis = plt.subplots(2)
-        axis[0].set_title("Etta")
-        axis[1].set_title("Error")
 
         for i in range(max_epochs):
             try:
                 alpha = i/(max_epochs-1.0) # zero to one
                 delta = 1.0-alpha # one to zero
                 etta_curr = pow(etta_final + (etta_initial-etta_final)*delta, etta_gamma)
-                error, fraction = self.train_epoch(domain_dataset, etta_curr, args)
+                error, fraction = (self.train_epoch if args.num_procs == 1 else self.train_epoch_mp)(domain_dataset, etta_curr, args, i==0)
                 print(f"Epoch #{i}: err={error}, fraction={fraction}, rate={etta_curr}")
                 data_etta.append(etta_curr)
                 data_error.append(error)
                 if data_etta and data_error:
                     axis[0].cla()
-                    axis[0].plot(range(len(data_etta)), data_etta)
-                    axis[1].cla()
-                    axis[1].plot(range(len(data_error)), data_error)
                     axis[0].set_title("Etta")
+                    axis[0].plot(range(len(data_etta)), data_etta, c='blue')
+                    axis[1].cla()
                     axis[1].set_title("Error")
+                    axis[1].plot(range(len(data_error)), data_error, c='red')
                     try:
                         fig.canvas.draw()
                         plt.pause(0.05)
@@ -453,6 +550,7 @@ def get_arg_parser():
 
     parser.add_argument('--max-epochs', '-e', help='maximum number of training epochs', nargs=1, type=int, default=DEFAULT_TRAINING_EPOCHS_MAX)
     parser.add_argument('--batch-size', '-b', help='number of epoch instances to train in a batch', nargs='?', type=int, default=DEFAULT_TRAINING_BATCH_SIZE)
+    parser.add_argument('--num-procs', '-j', help='number of processes used for training', nargs='?', type=int, default=DEFAULT_TRAINING_NUM_PROCS)
     parser.add_argument('--error-threshold', '-t', help='Error level to consider convergence', nargs='?', type=float, default=DEFAULT_ERROR_THRESHOLD)
     return parser
 
