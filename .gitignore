@@ -1,6 +1,6 @@
 .vscode
-mnist/*-*
-mnist/*-*
+ds/mnist/*-*
+ds/mnist/*-*
 venv/
 paper/conference-latex-template_10-17-19.zip
 paper/paper.aux
