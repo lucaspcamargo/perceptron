@@ -35,11 +35,12 @@ from PIL import Image
 # DEFAULTS
 
 PROG_NAME = 'perceptron'
-DEFAULT_TRAINING_EPOCHS_MAX = 100 
+DEFAULT_TRAINING_EPOCHS_MAX = 1000 
 DEFAULT_INITIAL_ETTA = 0.01      # Desired value of etta at the beginning of the training
-DEFAULT_FINAL_ETTA = DEFAULT_INITIAL_ETTA/100     # Desired value of etta at the end of the training
+DEFAULT_FINAL_ETTA = DEFAULT_INITIAL_ETTA     # Desired value of etta at the end of the training
 DEFAULT_ETTA_GAMMA = 2.2         # Control etta shape with an exponent
 DEFAULT_TRAINING_BATCH_SIZE = -1 # -1 means the entire dataset
+DEFAULT_ERROR_THRESHOLD = 0.001
 # DEBUG_FLAGS
 DUMP_ITERATION = False
 
@@ -127,6 +128,7 @@ class MoodleDatasetSource(DatasetSource):
                 klass = str(tokens[0])
                 values = [float(x) for x in tokens[1:]]
                 instance = Instance(klass, np.array(values))
+                print(instance)
                 instances.append(instance)
                 idx += 1
                 if dump:
@@ -200,6 +202,9 @@ class Instance:
     def __init__(self, klass, values):
         self._class = klass
         self.values = values
+
+    def __str__(self):
+        return f"(Instance class={self._class}, params: {self.values})"
 
 class Dataset:
     def __init__(self, source, partitioning_config=PartitioningConfig()):
@@ -303,13 +308,15 @@ class PerceptronClassifier:
     def __str__(self):
         return f'(PerceptronClassifier: {len(self._p)} perceptrons/classes)'
 
-    def train_iteration(self, batch, etta):
-        item: Instance
+    def train_batch(self, batch, etta):
+        item: Instance        
+        errors = []
+        fraction = []
         for item in batch:
             # train item
             for klass, perceptron in self._p.items():
                 expected = self._match_val if klass==item._class else self._not_match_val
-                input = np.concatenate((item.values, [self._bias,],))
+                input = np.concatenate((item.values, [self._bias,],)) # TODO simplify this, put a bias with all values automatically
                 output_vec = perceptron.weights * input
                 output = self._activation(sum(output_vec))
                 err = expected - output
@@ -329,34 +336,68 @@ class PerceptronClassifier:
                     print("final_weights", final_weights)
 
                 perceptron.weights = final_weights
+                errors.append(err*err)
+                fraction.append(0 if output!=expected else 1)
+        return np.average(errors), np.average(fraction)
 
-    def train_epoch(self, domain_dataset:Dataset, etta):
-        print('=======EPOCH======')
-        for i in domain_dataset.scrambled_view(PartitioningContext.TRAINING):
-            self.train_iteration((i,), etta)
-            #break # HACK FOR SIMPLE DATASET TODO param: batch size
+    def train_epoch(self, domain_dataset:Dataset, etta, args:argparse.Namespace):
+
+        source = domain_dataset.scrambled_view(PartitioningContext.TRAINING)
+        # split the source in sets of "x" batches
+        batches = [source[x:x+args.batch_size] for x in range(0, len(source), args.batch_size)] if args.batch_size != -1 else [source]
+        
+        # TODO fork or something of the sort?
+        size = []
+        errors = []
+        fraction = []
+
+        #process a batch
+        for i, b in enumerate(batches):
+            err, frac = self.train_batch(b, etta)
+            size.append(len(b))
+            errors.append(err)
+            fraction.append(frac)
+            print(f"Batch #{i}: err={err}, fraction={frac}")
+        print(size, errors, fraction)
+        return np.average(sum([a*b for a,b in zip(size, errors)])/sum(size)),\
+               np.average(sum([a*b for a,b in zip(size, fraction)])/sum(size))
  
     def train(self, domain_dataset:Dataset, args:argparse.Namespace):
         etta_gamma = DEFAULT_ETTA_GAMMA
         etta_initial = pow(DEFAULT_INITIAL_ETTA, 1.0/etta_gamma)
         etta_final = pow(DEFAULT_FINAL_ETTA, 1.0/etta_gamma)
         max_epochs = DEFAULT_TRAINING_EPOCHS_MAX
+        error_threshold = args.error_threshold
 
         data_etta = []
-        data_fraction = []
+        data_error = []
+        fig, axis = plt.subplots(2)
+        axis[0].set_title("Etta")
+        axis[1].set_title("Error")
 
         for i in range(max_epochs):
             try:
                 alpha = i/(max_epochs-1.0) # zero to one
                 delta = 1.0-alpha # one to zero
                 etta_curr = pow(etta_final + (etta_initial-etta_final)*delta, etta_gamma)
-                self.train_epoch(domain_dataset, etta_curr)
-                perfect, fraction = self.classify(domain_dataset, PartitioningContext.VALIDATION)
-                #print(fraction*100, '%   rate=',etta_curr)
+                error, fraction = self.train_epoch(domain_dataset, etta_curr, args)
+                print(f"Epoch #{i}: err={error}, fraction={fraction}, rate={etta_curr}")
                 data_etta.append(etta_curr)
-                data_fraction.append(fraction*100)
-                if perfect:
-                    print("[perceptron_classifier] train: all classification accurate, training complete")
+                data_error.append(error)
+                if data_etta and data_error:
+                    axis[0].cla()
+                    axis[0].plot(range(len(data_etta)), data_etta)
+                    axis[1].cla()
+                    axis[1].plot(range(len(data_error)), data_error)
+                    axis[0].set_title("Etta")
+                    axis[1].set_title("Error")
+                    try:
+                        fig.canvas.draw()
+                        plt.pause(0.05)
+                    except KeyboardInterrupt:
+                        raise
+                if error < error_threshold:
+                    print(f"[perceptron_classifier] train: error threshold met ({error} < {error_threshold})")
                     break
             except KeyboardInterrupt:
                 print("[perceptron_classifier] training interrupted")
@@ -364,11 +405,6 @@ class PerceptronClassifier:
         else:
             print("[perceptron_classifier] train: no convergence")
 
-        figure, axis = plt.subplots(2)
-        axis[0].plot(range(len(data_etta)), data_etta)
-        axis[0].set_title("Etta")
-        axis[1].plot(range(len(data_fraction)), data_fraction)
-        axis[1].set_title("Fraction")
         plt.show()
 
     
@@ -402,6 +438,12 @@ class PerceptronClassifier:
 
 
 ##################################################################################################
+# DATA COLLECTION
+
+# ... todo graphs and stuff here
+
+
+##################################################################################################
 # TOOL
 
 def get_arg_parser():
@@ -410,7 +452,8 @@ def get_arg_parser():
     parser.add_argument('dataset_info', help='required dataset filenames, or additional dataset parser parameters', nargs="*", type=str)
 
     parser.add_argument('--max-epochs', '-e', help='maximum number of training epochs', nargs=1, type=int, default=DEFAULT_TRAINING_EPOCHS_MAX)
-    parser.add_argument('--batch-size', '-b', help='number of epoch instances to train in a batch', nargs=1, type=int, default=DEFAULT_TRAINING_BATCH_SIZE)
+    parser.add_argument('--batch-size', '-b', help='number of epoch instances to train in a batch', nargs='?', type=int, default=DEFAULT_TRAINING_BATCH_SIZE)
+    parser.add_argument('--error-threshold', '-t', help='Error level to consider convergence', nargs='?', type=float, default=DEFAULT_ERROR_THRESHOLD)
     return parser
 
 def get_datasource(args):
@@ -437,7 +480,9 @@ def main():
 
     print("Starting training")
     classifier.train(dataset, args)
-    #classifier.classify(dataset, PartitioningContext.VALIDATION)
+
+    print("Final classification...")
+    print(classifier.classify(dataset))
     
 
 if __name__ == "__main__":
