@@ -8,21 +8,22 @@ Programa de Pós-Graduação em Engenharia de Sistemas Eletrônicos – PPGESE
 in a variety of configurations.
 
 - TODO list:
-    - Numpy aready takes care of paralellization if you use the matrices right.
+    - Numpy aready takes care of paralellization if you use the matrices right. CHECK
       Use it instead of mp.Pool. For that:
-        - Consolidate dataset on a single matrix (add "bias" parameter automatically, set as one);
-        - Consolidate all perceptrons of a layer on a single matrix (add "bias" random weight automatically);
-        - Calculate the weighted inputs to all perceptrons on a layer at once, and then sum them up for every perceptron;
-        - Apply activation function for the entire result using numpy stuff.
-        - Calculate error using numpy.
-        - By this point, you know.
-    - Do MLP right the first time, taking advantage of the above;
+        - Consolidate dataset on a single matrix (add "bias" parameter automatically, set as one); CHECK
+        - Consolidate all perceptrons of a layer on a single matrix (add "bias" random weight automatically); CHECK
+        - Calculate the weighted inputs to all perceptrons on a layer at once, and then sum them up for every perceptron; CHECK
+        - Apply activation function for the entire result using numpy stuff. CHECK
+        - Calculate error using numpy. CHECK
+        - Implement some actual batch handling.
+        - Make all process arguments work.
+    - Do MLP right the first time, taking advantage of the above; CHECK-ish
+    - Allow storage of arbitrary per-epoch and per-batch stats, and plotting them;
     - Support different operations (with argparser subcommands maybe);
         - Classifier training and network save to file;
         - Classifier load from file and classify dataset;
     - Figure out what to do with partitioning;
     - Take a look at mROC;
-    - Allow storage of arbitrary per-epoch and per-batch stats, and plotting them;
     - Allow doing multiple training runs by varying the training parameters, and plotting them as multiple lines on the same graph for comparison;
     - BONUS: small UI tool that lets the user load/draw image to feed the neural network with, and see the outputs and some data.
 
@@ -155,7 +156,6 @@ class MoodleDatasetSource(DatasetSource):
                 klass = str(tokens[0])
                 values = [float(x) for x in tokens[1:]]
                 instance = Instance(klass, np.array(values))
-                print(instance)
                 instances.append(instance)
                 idx += 1
                 if dump:
@@ -167,8 +167,6 @@ class MoodleDatasetSource(DatasetSource):
 
         params = [f'p{x}' for x in range(64)]
         classes = [str(x) for x in range(10)]
-        print(params)
-        print(classes)
         return params, instances, classes
 
     def __str__(self):
@@ -351,6 +349,8 @@ class PerceptronClassifier:
     """
     Classification algorithm using a single perceptron per class.
     For this to work 100%, problem must be linearly separable.
+
+    TODO DELETE THIS AFTER MLP works for this case and after plottinh code is moved out and made better
     """
     def __init__(self, domain_dataset):
         self._p = {klass: Perceptron(domain_dataset) for klass in domain_dataset.classes}
@@ -551,11 +551,18 @@ class MLPClassifier:
     def __init__(self, domain_dataset:Dataset):
         self._classes = domain_dataset.classes
         self._layers: list[PerceptronLayer] = []
-        self._layers.append(PerceptronLayer(len(self._classes), len(domain_dataset.params)+1))
-        self._bias = 1.0
-        self._activation = lambda x: 1.0 if x>=0.0 else 0.0  # TODO these values are literals in MP code
-        self._match_val = self._activation(1.0)
-        self._not_match_val = self._activation(-1.0)
+        self._activation = MLPClassifier.step
+
+        # build layers
+        curr_input_sz = len(domain_dataset.params)+1
+        hidden_szs = [128]
+        for sz in hidden_szs:
+            break
+            self._layers.append(PerceptronLayer(sz, curr_input_sz))
+            curr_input_sz = sz
+
+        # build output layer
+        self._layers.append(PerceptronLayer(len(self._classes), curr_input_sz))
 
     def _config_threads(self, args):
         import os
@@ -563,6 +570,14 @@ class MLPClassifier:
             numstr = str(args.num_procs)
             for envvar in SMP_ENV_VARS:
                 os.environ[envvar] = numstr
+
+    @staticmethod
+    def sigmoid(x:np.ndarray) -> np.ndarray:
+        return 1/(1+np.exp(-x))
+
+    @staticmethod
+    def step(x:np.ndarray) -> np.ndarray:
+        return np.heaviside(x, 1.0)
     
     def train(self, domain_dataset:Dataset, args:argparse.Namespace):
 
@@ -576,15 +591,18 @@ class MLPClassifier:
         for i in range(args.max_epochs):
             print(f"Epoch #{i}: start")
             outputs_float = np.matmul(params, weights)
-            outputs_act = np.heaviside(outputs_float, 1.0)
+            outputs_act = MLPClassifier.step(outputs_float)
             err = ref - outputs_act
-            err_squared = np.square(err)
+            err_squared = 0.5 * np.square(err)
             err_accum = np.average(err_squared)
             learn = np.matmul(params.transpose(), err)
             weights += etta * learn
-            print(weights.shape, outputs_float.shape, ref.shape, err.shape, err_squared.shape, learn.shape)
+            #print(weights.shape, outputs_float.shape, ref.shape, err.shape, err_squared.shape, learn.shape)
             # print(excitation)
             print(f"Epoch #{i}: end, err_accum = {err_accum}")
+            if err_accum == 0.0:
+                break
+        self._layers[0]._w = weights
             
 
 
@@ -605,6 +623,7 @@ def get_arg_parser():
     parser.add_argument('parser_name', help='id of the parser to use', type=str, nargs='?')
     parser.add_argument('dataset_info', help='required dataset filenames, or additional dataset parser parameters', nargs="*", type=str)
 
+    parser.add_argument('--layout', '-l', help='Comma-separated list of hidden layer sizes. Defaults to no hidden layers (simple perceptron).')
     parser.add_argument('--max-epochs', '-e', help='maximum number of training epochs', nargs='?', type=int, default=DEFAULT_TRAINING_EPOCHS_MAX)
     parser.add_argument('--batch-size', '-b', help='number of epoch instances to train in a batch', nargs='?', type=int, default=DEFAULT_TRAINING_BATCH_SIZE)
     parser.add_argument('--num-procs', '-j', help='number of processes used for training', nargs='?', type=int, default=DEFAULT_TRAINING_NUM_PROCS)
@@ -627,19 +646,16 @@ def main():
     args = parser.parse_args()
     print(args)
 
-    #datasource = IrisDatasetSource("iris/params", "iris/iris.data")
-    #datasource = MoodleDatasetSource("moodle/data.csv")
     datasource = get_datasource(args)
     dataset = Dataset(datasource)
-    #classifier = PerceptronClassifier(dataset)
     classifier = MLPClassifier(dataset)
     print(classifier)
 
     print("Starting training")
     classifier.train(dataset, args)
 
-    print("Final classification...")
-    print(classifier.classify(dataset))
+    #print("Final classification...")
+    #print(classifier.classify(dataset))
     
 
 if __name__ == "__main__":
