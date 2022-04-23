@@ -233,11 +233,22 @@ class Instance:
     def __str__(self):
         return f"(Instance class={self._class}, params: {self.values})"
 
+    def expected_output(self, classes):
+         ret = np.zeros(len(classes))
+         ret[classes.index(self._class)] = 1.0
+         return ret
+
 class Dataset:
     def __init__(self, source, partitioning_config=PartitioningConfig()):
         
         self._source = source
         self._cols, self._instances, self._classes = source.read()
+        print("Coalescing dataset (1/2)")
+        self.param_mat = np.asarray([np.concatenate((i.values, [1.0,],)) for i in self._instances ])
+        print("Coalescing dataset (2/2)")
+        self.ref_mat = np.asarray([i.expected_output(self._classes) for i in self._instances ])
+        print("Serializing dataset")
+        self.param_mat.dump("dataset.dump")
 
         if not self._cols:
             raise ValueError("Dataset source has no parameter ids!")
@@ -329,26 +340,10 @@ class PerceptronLayer:
             - icount: number of inputs for every perceptron (e.g. number of dataset parameters + 1 for the bias)
         """
         # plus 1 for bias
-        assert(pcount)
-        wlen = len(icount)
-        self._w = 2.0*np.random.random((pcount, wlen,)) - np.ones((pcount, wlen,))
-        print(f"[perceptron_layer] init: {wlen-1}+1 weights for {pcount} perceptrons",self._w)
-
-    @property
-    def weights(self):
-        return self._w
-
-    @weights.setter
-    def weights(self, wval):
-        assert(type(self._w)==type(wval))
-        self._w = wval
-
-    @property
-    def weights_T(self):
-        return np.atleast_2d(self._w).transpose()
-
-    def __str__(self):
-        return f'(Perceptron: {self._w})'
+        assert pcount
+        assert icount
+        self._w = 2.0*np.random.random((icount, pcount,)) - np.ones((icount, pcount,))
+        print(f"[perceptron_layer] init: {icount-1}+1 weights for {pcount} perceptrons")
 
 
 
@@ -367,40 +362,7 @@ class PerceptronClassifier:
     def __str__(self):
         return f'(PerceptronClassifier: {len(self._p)} perceptrons/classes)'
 
-    def train_batch(self, batch, etta, dry_run):
-        item: Instance        
-        errors = []
-        fraction = []
-        for item in batch:
-            # train item
-            for klass, perceptron in self._p.items():
-                expected = self._match_val if klass==item._class else self._not_match_val
-                input = np.concatenate((item.values, [self._bias,],)) # TODO simplify this, put a bias with all values automatically
-                output_vec = perceptron.weights * input
-                output = self._activation(sum(output_vec))
-                err = expected - output
-                learn = err * input
-                final_weights =  perceptron.weights + learn*etta
-                if DUMP_ITERATION:
-                    print('--')
-                    print("values", item.values)
-                    print("weights", perceptron.weights)
-                    print("output_vec", output_vec)
-                    print("output", output)
-                    print("expected", expected)
-                    print("err", err)
-                    print("learn", learn)
-                    print("etta", etta)
-                    print("learn*etta", learn*etta)
-                    print("final_weights", final_weights)
-
-                if not dry_run:
-                    perceptron.weights = final_weights
-                errors.append(err*err)
-                fraction.append(0 if output!=expected else 1)
-        return np.average(errors), np.average(fraction)
-
-
+    @staticmethod
     def train_batch_static(perceptrons, batch, etta, dry_run):
         item: Instance        
         errors = []
@@ -434,10 +396,7 @@ class PerceptronClassifier:
 
         #process all batches one after the other
         for i, b in enumerate(batches):
-            if True: # use static func for single-thread too
-                err, frac = PerceptronClassifier.train_batch_static(self._p, b, etta, dry_run)
-            else:
-                err, frac = self.train_batch(b, etta, dry_run)
+            err, frac = PerceptronClassifier.train_batch_static(self._p, b, etta, dry_run)
             size.append(len(b))
             errors.append(err)
             fraction.append(frac)
@@ -589,8 +548,10 @@ class PerceptronClassifier:
 
 class MLPClassifier:
 
-    def __init__(self, domain_dataset):
-        self._p = {klass: Perceptron(domain_dataset) for klass in domain_dataset.classes}
+    def __init__(self, domain_dataset:Dataset):
+        self._classes = domain_dataset.classes
+        self._layers: list[PerceptronLayer] = []
+        self._layers.append(PerceptronLayer(len(self._classes), len(domain_dataset.params)+1))
         self._bias = 1.0
         self._activation = lambda x: 1.0 if x>=0.0 else 0.0  # TODO these values are literals in MP code
         self._match_val = self._activation(1.0)
@@ -602,6 +563,28 @@ class MLPClassifier:
             numstr = str(args.num_procs)
             for envvar in SMP_ENV_VARS:
                 os.environ[envvar] = numstr
+    
+    def train(self, domain_dataset:Dataset, args:argparse.Namespace):
+
+        self._config_threads(args)
+
+        etta = 0.01
+
+        weights = self._layers[0]._w
+        params = domain_dataset.param_mat
+        ref = domain_dataset.ref_mat
+        for i in range(args.max_epochs):
+            print(f"Epoch #{i}: start")
+            outputs_float = np.matmul(params, weights)
+            outputs_act = np.heaviside(outputs_float, 1.0)
+            err = ref - outputs_act
+            err_squared = np.square(err)
+            err_accum = np.average(err_squared)
+            learn = np.matmul(params.transpose(), err)
+            weights += etta * learn
+            print(weights.shape, outputs_float.shape, ref.shape, err.shape, err_squared.shape, learn.shape)
+            # print(excitation)
+            print(f"Epoch #{i}: end, err_accum = {err_accum}")
             
 
 
@@ -622,7 +605,7 @@ def get_arg_parser():
     parser.add_argument('parser_name', help='id of the parser to use', type=str, nargs='?')
     parser.add_argument('dataset_info', help='required dataset filenames, or additional dataset parser parameters', nargs="*", type=str)
 
-    parser.add_argument('--max-epochs', '-e', help='maximum number of training epochs', nargs=1, type=int, default=DEFAULT_TRAINING_EPOCHS_MAX)
+    parser.add_argument('--max-epochs', '-e', help='maximum number of training epochs', nargs='?', type=int, default=DEFAULT_TRAINING_EPOCHS_MAX)
     parser.add_argument('--batch-size', '-b', help='number of epoch instances to train in a batch', nargs='?', type=int, default=DEFAULT_TRAINING_BATCH_SIZE)
     parser.add_argument('--num-procs', '-j', help='number of processes used for training', nargs='?', type=int, default=DEFAULT_TRAINING_NUM_PROCS)
     parser.add_argument('--error-threshold', '-t', help='Error level to consider convergence', nargs='?', type=float, default=DEFAULT_ERROR_THRESHOLD)
@@ -648,7 +631,8 @@ def main():
     #datasource = MoodleDatasetSource("moodle/data.csv")
     datasource = get_datasource(args)
     dataset = Dataset(datasource)
-    classifier = PerceptronClassifier(dataset)
+    #classifier = PerceptronClassifier(dataset)
+    classifier = MLPClassifier(dataset)
     print(classifier)
 
     print("Starting training")
