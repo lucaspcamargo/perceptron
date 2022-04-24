@@ -25,7 +25,7 @@ in a variety of configurations.
     - Figure out what to do with partitioning;
     - Take a look at mROC;
     - Allow doing multiple training runs by varying the training parameters, and plotting them as multiple lines on the same graph for comparison;
-    - BONUS: small UI tool that lets the user load/draw image to feed the neural network with, and see the outputs and some data.
+    - BONUS: small UI tool that lets the user load/draw image to feed the neural network with, and see the outputs and some data - CHECK
 
 - We are able to use the following datasets:
     - synthetic, linearly-separable (mine);
@@ -35,6 +35,7 @@ in a variety of configurations.
 """
 
 # deps
+from itertools import count
 import numpy as np
 from matplotlib import pyplot as plt
 
@@ -132,7 +133,7 @@ class IrisDatasetSource(DatasetSource):
                 instance = Instance(klass, np.array(values))
                 _instances.append(instance)
         print(f'[dataset] {self.data_filename}: loaded {len(_instances)} instances')
-        return _cols, _instances, _classes
+        return _cols, _instances, _classes, None
 
     def __str__(self):
         return f'IrisDatasetSource("{self.params_filename}","{self.data_filename}")'
@@ -167,7 +168,7 @@ class MoodleDatasetSource(DatasetSource):
 
         params = [f'p{x}' for x in range(64)]
         classes = [str(x) for x in range(10)]
-        return params, instances, classes
+        return params, instances, classes, (8,8,)
 
     def __str__(self):
         return f'MoodleDatasetSource("{self.filename}")'
@@ -211,7 +212,7 @@ class MNISTDatasetSource(DatasetSource):
 
         params = [f'p{x}' for x in range(imsz)]
         classes = list(set(labels))
-        return params, instances, classes
+        return params, instances, classes, (cols, rows,)
 
     def __str__(self):
         return f'MoodleDatasetSource("{self.fname_images}","{self.fname_labels}")'
@@ -240,7 +241,7 @@ class Dataset:
     def __init__(self, source, partitioning_config=PartitioningConfig()):
         
         self._source = source
-        self._cols, self._instances, self._classes = source.read()
+        self._cols, self._instances, self._classes, self.image_dims = source.read()
         print("Coalescing dataset (1/2)")
         self.param_mat = np.asarray([np.concatenate((i.values, [1.0,],)) for i in self._instances ])
         print("Coalescing dataset (2/2)")
@@ -340,7 +341,7 @@ class PerceptronLayer:
         # plus 1 for bias
         assert pcount
         assert icount
-        self._w = 2.0*np.random.random((icount, pcount,)) - np.ones((icount, pcount,))
+        self.weights = 2.0*np.random.random((icount, pcount,)) - np.ones((icount, pcount,))
         print(f"[perceptron_layer] init: {icount-1}+1 weights for {pcount} perceptrons")
 
 
@@ -350,7 +351,7 @@ class PerceptronClassifier:
     Classification algorithm using a single perceptron per class.
     For this to work 100%, problem must be linearly separable.
 
-    TODO DELETE THIS AFTER MLP works for this case and after plottinh code is moved out and made better
+    TODO DELETE THIS AFTER MLP works for this case and after plotting code is moved out and made better
     """
     def __init__(self, domain_dataset):
         self._p = {klass: Perceptron(domain_dataset) for klass in domain_dataset.classes}
@@ -548,21 +549,23 @@ class PerceptronClassifier:
 
 class MLPClassifier:
 
-    def __init__(self, domain_dataset:Dataset):
+    def __init__(self, domain_dataset:Dataset, args:argparse.Namespace):
         self._classes = domain_dataset.classes
         self._layers: list[PerceptronLayer] = []
-        self._activation = MLPClassifier.step
+        self._activation = MLPClassifier.sigmoid
 
         # build layers
         curr_input_sz = len(domain_dataset.params)+1
-        hidden_szs = [128]
+        hidden_szs = [int(x) for x in args.layout.split(',')] if args.layout else []
         for sz in hidden_szs:
-            break
             self._layers.append(PerceptronLayer(sz, curr_input_sz))
-            curr_input_sz = sz
+            curr_input_sz = sz+1 # +1 for bias
 
         # build output layer
         self._layers.append(PerceptronLayer(len(self._classes), curr_input_sz))
+
+    def __str__(self):
+        return f'(MLPClassifier: {self._layers[0].weights.shape[0]} inputs, {len(self._classes)} classes, {len(self._layers)} layers)'
 
     def _config_threads(self, args):
         import os
@@ -572,39 +575,145 @@ class MLPClassifier:
                 os.environ[envvar] = numstr
 
     @staticmethod
-    def sigmoid(x:np.ndarray) -> np.ndarray:
+    def sigmoid(x:np.ndarray, derivative=False) -> np.ndarray:
+        if derivative:
+            sigx = MLPClassifier.sigmoid(x)
+            return sigx*(1-sigx)
         return 1/(1+np.exp(-x))
 
     @staticmethod
-    def step(x:np.ndarray) -> np.ndarray:
-        return np.heaviside(x, 1.0)
+    def step(x:np.ndarray, derivative=False) -> np.ndarray:
+        # not to self: here heaviside is a sign() function with a special case for zero
+        return np.heaviside(x, 1.0 if not derivative else 0.0)
     
     def train(self, domain_dataset:Dataset, args:argparse.Namespace):
 
         self._config_threads(args)
 
-        etta = 0.01
-
-        weights = self._layers[0]._w
+        etta = 0.02
         params = domain_dataset.param_mat
-        ref = domain_dataset.ref_mat
+        reference = domain_dataset.ref_mat
+
+        print('MLP training::')
+        print(f'classes:{len(domain_dataset.classes)} instances:{len(domain_dataset.instances)}')
+        print(f'params:{params.shape} references:{reference.shape}')
+
+        dp_avg_cost = []
+    
         for i in range(args.max_epochs):
             print(f"Epoch #{i}: start")
-            outputs_float = np.matmul(params, weights)
-            outputs_act = MLPClassifier.step(outputs_float)
-            err = ref - outputs_act
-            err_squared = 0.5 * np.square(err)
-            err_accum = np.average(err_squared)
-            learn = np.matmul(params.transpose(), err)
-            weights += etta * learn
-            #print(weights.shape, outputs_float.shape, ref.shape, err.shape, err_squared.shape, learn.shape)
-            # print(excitation)
-            print(f"Epoch #{i}: end, err_accum = {err_accum}")
-            if err_accum == 0.0:
-                break
-        self._layers[0]._w = weights
-            
+            # source = domain_dataset.scrambled_view(PartitioningContext.TRAINING) TODO improve batching
+            source = params # TODO scramble
+            # split the source in sets of "x" batches
+            batches = [source[x:x+args.batch_size,:] for x in range(0, len(source), args.batch_size)] if args.batch_size != -1 else [source]
+            refs = [reference[x:x+args.batch_size,:] for x in range(0, len(source), args.batch_size)] if args.batch_size != -1 else [reference]
 
+            for batchnum, batch in enumerate(batches):
+                print(f"Batch #{batchnum}")
+                ref = refs[batchnum]
+                inputs = []
+                activations = []
+                outputs = []
+                deltas = []
+
+
+                # first, feed-forward
+                for layeridx, layer in enumerate(self._layers):
+                    print(f"FF layer {layeridx}")
+                    layer_input = outputs[-1] if outputs else batch
+                    if layer_input.shape[1] == layer.weights.shape[0]-1:
+                        # bias missing in params
+                        layer_input = np.concatenate((layer_input, np.ones((layer_input.shape[0],1,),),), 1)
+                    print(f"layer_input:{layer_input.shape} weights:{layer.weights.shape}")
+                    inputs.append(layer_input)
+                    activation = np.matmul(layer_input, layer.weights)
+                    activations.append(activation)
+                    output = self._activation(activation)
+                    outputs.append(output)
+                    if layer == self._layers[-1]:
+                        # output layer, calc delta on last step                    
+                        err = output - ref
+                        err_sq = 0.5 * np.square(err)
+                        cost = np.sum(err_sq, 0) # cost per class
+                        avg_cost = np.average(cost)
+                        dp_avg_cost.append(avg_cost)
+                        print(f'last_layer: layer_input:{layer_input.shape} cost:{cost}:avg={avg_cost}')
+                        delta = (err)*output*(1.0-output) # assuming sigmoid activation
+                        deltas.append(delta)
+                        print(f'last_layer: w:{layer.weights.shape} etta:{etta} delta:{delta.shape}')
+                    
+                # calculate other deltas backwards
+                for layeridx, layer in reversed(list(enumerate(self._layers[:-1]))):
+                    print(f"calculating delta {layeridx}")
+                    delta_next = deltas[0]
+                    if len(deltas) != 1:
+                        delta_next = delta_next[:,:-1] # not an output delta, discard bias column
+                    this_output = outputs[layeridx]
+                    this_output = np.concatenate((this_output, np.ones((this_output.shape[0],1,),),), 1)
+                    weights_n_t = self._layers[layeridx+1].weights.transpose()
+                    print(f"delta_next:{delta_next.shape} this_output:{this_output.shape} weights_n_t:{weights_n_t.shape}")
+                    delta = np.matmul(delta_next, weights_n_t)*(this_output*(1.0-this_output)) # assuming sigmoid activation
+                    print(f"delta:{delta.shape}")
+                    deltas.insert(0, delta) # put first
+
+                assert len(inputs) == len(outputs) == len(deltas)    
+                
+                # now backpropagate
+                for layeridx, layer in enumerate(self._layers):
+                    print(f"adjusting {layeridx}")
+                    print("inputs",inputs[layeridx].shape)
+                    print("deltas",deltas[layeridx].shape)
+                    print("weights",layer.weights.shape)
+                    gradient = np.matmul(deltas[layeridx].transpose(), inputs[layeridx]).transpose()
+                    #if gradient.shape[1] == layer.weights.shape[1]+1:
+                    #    gradient = gradient[:,:-1] # TODO discard bias gradient? is this correct?
+                    layer.weights -= etta * gradient
+                
+
+                err_accum = np.average(cost) 
+                #print(weights.shape, outputs_float.shape, ref.shape, err.shape, err_squared.shape, learn.shape)
+                # print(excitation)
+                print(f"Epoch #{i}: end, err_accum = {err_accum}")
+                if err_accum == 0.0:
+                    break
+                
+                # PRINT ALL (help debug single layer, single batch)
+                print("BATCH", batch)
+                print("OUTPUTS", outputs)
+                print("WEIGHTS", layer.weights)
+                print("REF", ref)
+                print("DELTAS", deltas)
+                print("LAST GRADIENT", gradient)
+                print("ERROR", err)
+                break
+        
+        if args.plot:
+            plt.plot(list(range(len(dp_avg_cost))), dp_avg_cost)
+            plt.show()
+
+    def classify_single(self, single):
+        """
+        Classify a single input without bias.
+        Parameter:
+            - A list of input values, without bias column.
+        """
+        single = np.atleast_2d(np.concatenate((single, [1.0,],)))
+        outputs = []
+        for layeridx, layer in enumerate(self._layers):
+            layer_input = outputs[-1] if outputs else single
+            print(f"layer_input:{layer_input.shape} weights:{layer.weights.shape}")
+            outputs_float = self.get_weighted_inputs(layeridx, layer_input)
+            outputs_act = self._activation(outputs_float)
+            outputs.append(outputs_act)
+        return outputs[-1] # TODO deduplicate this feed-forward code
+
+    
+    def get_weighted_inputs(self, layeridx, params):
+        w = self._layers[layeridx].weights
+        if params.shape[1] == w.shape[0]-1:
+            # bias missing in params
+            params = np.concatenate((params, np.ones((params.shape[0],1,),),), 1)
+        return np.matmul(params, w)
 
 
 
@@ -618,17 +727,127 @@ class MLPClassifier:
 ##################################################################################################
 # TOOL
 
+import sys
+from PyQt5.QtCore import Qt, QPoint
+from PyQt5.QtWidgets import QMainWindow, QApplication
+from PyQt5.QtGui import QImage, QPainter, QPen, QKeyEvent, QFont
+
+
+class DrawingTool(QMainWindow):
+    """
+    A window that allows the user to draw something and see how the classifier responds
+    This was (stolen and) adapted from: https://stackoverflow.com/a/51475353
+    """
+
+    def __init__(self, classifier:MLPClassifier, img_dims):
+        super().__init__()
+        self.setWindowTitle(f"DrawingTool -- {classifier}")
+        self.classifier = classifier
+        self.drawing = False
+        self.lastPoint = QPoint()
+        self.image = QImage(img_dims[0], img_dims[1], QImage.Format.Format_Grayscale8)
+        self.image.fill(Qt.black)
+        self.scale = 20
+        self.bottom_h = 20
+        self.resize(self.image.width()*self.scale, self.image.height()*self.scale+self.bottom_h)
+        self.draw_instructions = True
+        self.reclassify()
+        self.show()
+
+    def keyPressEvent(self, a0: QKeyEvent) -> None:
+        if a0.text().lower() == 'c':
+            self.draw_instructions = True
+            self.image.fill(Qt.black)
+            self.reclassify()
+            self.update()
+        return super().keyPressEvent(a0)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        myrect = self.rect()
+        myrect.setHeight(myrect.height()-self.bottom_h)
+        painter.drawImage(myrect, self.image)
+        painter.setFont(QFont("Monospace,mono,serif", 12, [-1, QFont.Bold][0], True))
+        painter.fillRect(0,self.width(),self.width(),self.bottom_h,Qt.lightGray)
+        txtpoint = QPoint(10,self.width()+15)
+        painter.setPen(self.caption_color)
+        painter.drawText(txtpoint, self.caption)
+        if self.draw_instructions:
+            painter.setPen(Qt.white)
+            painter.drawText(self.rect(), int(Qt.AlignmentFlag.AlignVCenter) + int(Qt.AlignmentFlag.AlignHCenter), "Draw a number with the mouse")
+
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.drawing = True
+            self.lastPoint = event.pos()/self.scale
+
+    def mouseMoveEvent(self, event):
+        self.draw_instructions = False
+        if event.buttons() and Qt.LeftButton and self.drawing:
+            painter = QPainter(self.image)
+            painter.setPen(QPen(Qt.white, 1, Qt.SolidLine))
+            currpos = event.pos()/self.scale
+            painter.drawLine(self.lastPoint, currpos)
+            self.lastPoint = currpos
+            self.reclassify()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button == Qt.LeftButton:
+            self.drawing = False
+
+    def reclassify(self):
+        input = self.image.convertToFormat(QImage.Format.Format_Grayscale8)
+        ptr = input.constBits()
+        ptr.setsize(input.height() * input.width())
+        arr:np.ndarray = np.frombuffer(ptr, np.uint8) 
+        arrfloat = arr.astype(np.float32)
+        print(arrfloat, arrfloat.shape)
+        out = self.classifier.classify_single(arrfloat)
+        print(out)
+
+        tbl = ""
+        ctbl = ""
+        for i,c in enumerate(self.classifier._classes):
+            val = out[0][i]
+            prefix = "\u001b[33m\u001b[1m" if val else ""
+            suffix = '\u001b[0m' if val else ''
+            ctbl+=f'{prefix}{c}:{val}{suffix}\t'
+            if val > 0.66:
+                tbl+=f'{c}:{val} '
+        self.caption = tbl if tbl else "(no classes match)"
+        if not self.draw_instructions:
+            self.caption += " - press 'c' to clear"
+        self.caption_color = (Qt.blue if tbl.count(":") == 1 else Qt.black) if tbl else Qt.red
+        print(tbl)
+
+    @staticmethod
+    def run(classifier, image_dims):
+        app = QApplication(sys.argv)
+        main = DrawingTool(classifier, image_dims)
+        (main) # unused ref
+        sys.exit(app.exec_())
+
+
+def plot_confusion(classifier):
+    pass
+
+
 def get_arg_parser():
     parser = argparse.ArgumentParser(PROG_NAME)
     parser.add_argument('parser_name', help='id of the parser to use', type=str, nargs='?')
     parser.add_argument('dataset_info', help='required dataset filenames, or additional dataset parser parameters', nargs="*", type=str)
 
-    parser.add_argument('--layout', '-l', help='Comma-separated list of hidden layer sizes. Defaults to no hidden layers (simple perceptron).')
+    parser.add_argument('--layout', '-l', help='Comma-separated list of hidden layer sizes. Defaults to no hidden layers (simple perceptron).', 
+                        nargs='?', type=str, default="")
     parser.add_argument('--max-epochs', '-e', help='maximum number of training epochs', nargs='?', type=int, default=DEFAULT_TRAINING_EPOCHS_MAX)
     parser.add_argument('--batch-size', '-b', help='number of epoch instances to train in a batch', nargs='?', type=int, default=DEFAULT_TRAINING_BATCH_SIZE)
     parser.add_argument('--num-procs', '-j', help='number of processes used for training', nargs='?', type=int, default=DEFAULT_TRAINING_NUM_PROCS)
     parser.add_argument('--error-threshold', '-t', help='Error level to consider convergence', nargs='?', type=float, default=DEFAULT_ERROR_THRESHOLD)
     parser.add_argument('--skip-dry-run', '-s', help='Skip making epoch #0 a dry-run', action='store_true')
+    parser.add_argument('--plot', '-p', help='Show plots after training', action='store_true')
+    parser.add_argument('--draw', '-d', help='Launch drawing tool to test classifier', action='store_true')
     return parser
 
 def get_datasource(args):
@@ -648,7 +867,7 @@ def main():
 
     datasource = get_datasource(args)
     dataset = Dataset(datasource)
-    classifier = MLPClassifier(dataset)
+    classifier = MLPClassifier(dataset, args)
     print(classifier)
 
     print("Starting training")
@@ -656,6 +875,13 @@ def main():
 
     #print("Final classification...")
     #print(classifier.classify(dataset))
+
+    if args.draw:
+        if dataset.image_dims:
+            print("Drawing tool...")
+            DrawingTool.run(classifier, dataset.image_dims)
+        else:
+            print("Dataset has no image dimensions for input. Cannot run drawing tool.")
     
 
 if __name__ == "__main__":
