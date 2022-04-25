@@ -17,11 +17,12 @@ in a variety of configurations.
         - Calculate error using numpy. CHECK
         - Implement some actual batch handling.
         - Make all process arguments work.
-    - Do MLP right the first time, taking advantage of the above; CHECK-ish
+    - Do MLP right the first time, taking advantage of the above; CHECK(?)
+    - TODO review math
     - Allow storage of arbitrary per-epoch and per-batch stats, and plotting them;
-    - Support different operations (with argparser subcommands maybe);
-        - Classifier training and network save to file;
-        - Classifier load from file and classify dataset;
+    - Support different operations;
+        - Classifier training and network save to file; - CHECK
+        - Classifier load from file and classify dataset; - CHECK
     - Figure out what to do with partitioning;
     - Take a look at mROC;
     - Allow doing multiple training runs by varying the training parameters, and plotting them as multiple lines on the same graph for comparison;
@@ -32,6 +33,8 @@ in a variety of configurations.
     - iris;
     - simplified handwritten digit dataset, from moodle;
     - MNIST.
+
+- There is also a reference implementation that uses the scikit.learn implementation for performance comparison.
 """
 
 # deps
@@ -50,17 +53,21 @@ from collections import namedtuple
 from PIL import Image
 import multiprocessing as mp
 
+# comparison
+from sklearn.neural_network import MLPClassifier as SKLMLPClassifier
+
 
 ##################################################################################################
 # DEFAULTS
 
 PROG_NAME = 'perceptron'
 DEFAULT_TRAINING_EPOCHS_MAX = 1000 
-DEFAULT_INITIAL_ETTA = 0.01      # Desired value of etta at the beginning of the training
+DEFAULT_INITIAL_ETTA = 0.001      # Desired value of etta at the beginning of the training
 DEFAULT_FINAL_ETTA = DEFAULT_INITIAL_ETTA     # Desired value of etta at the end of the training
 DEFAULT_ETTA_GAMMA = 2.2         # Control etta shape with an exponent
 DEFAULT_TRAINING_BATCH_SIZE = -1 # -1 means the entire dataset
-DEFAULT_ERROR_THRESHOLD = 0.001
+DEFAULT_ERROR_THRESHOLD = 0.003
+DEFAULT_MOMENTUM = 0.8
 DEFAULT_TRAINING_NUM_PROCS = 1
 # DEBUG_FLAGS
 DUMP_ITERATION = False
@@ -547,6 +554,46 @@ class PerceptronClassifier:
 
 
 
+class SciKitLearnMLPClassifier:
+
+    def __init__(self, dataset, args):
+        self.dataset = dataset
+        self._classes = dataset.classes
+        self.args = args
+        self.classifier = SKLMLPClassifier(
+            solver='sgd',
+            hidden_layer_sizes=tuple([int(x) for x in args.layout.split(',')]), 
+            activation='logistic',
+            batch_size=int(args.batch_size) if args.batch_size != -1 else 'auto',
+            verbose=True,
+            max_iter=int(args.max_epochs),
+            learning_rate_init = DEFAULT_INITIAL_ETTA,
+            learning_rate='constant'
+        )
+        
+
+    def __str__(self):
+        return f'(SciKitLearnMLPClassifier: {len(self.dataset.params)} inputs, {len(self.dataset.classes)} classes)'
+
+    def train(self, domain_dataset:Dataset, args:argparse.Namespace):
+        self.classifier.fit(domain_dataset.param_mat, domain_dataset.ref_mat)
+        print(self.classifier)
+        if args.plot:
+            fig, axis = plt.subplots(2,1)
+            plt.subplots_adjust(hspace = 0.4)
+            axis[0].set_title("Loss curve")
+            axis[0].plot(list(range(len(self.classifier.loss_curve_))), self.classifier.loss_curve_, c='purple')
+            #axis[1].set_title("Intercepts")
+            #axis[1].plot(list(range(len(self.classifier.intercepts_))), self.classifier.intercepts_, c='red')
+            plt.show()
+    
+    def classify_single(self, single):
+        single = np.atleast_2d(np.concatenate((single, [1.0,],)))
+        res = self.classifier.predict(single)
+        print(res)
+        return res
+        
+
 class MLPClassifier:
 
     def __init__(self, domain_dataset:Dataset, args:argparse.Namespace):
@@ -577,118 +624,164 @@ class MLPClassifier:
     @staticmethod
     def sigmoid(x:np.ndarray, derivative=False) -> np.ndarray:
         if derivative:
-            sigx = MLPClassifier.sigmoid(x)
-            return sigx*(1-sigx)
+            return x*(1-x)
         return 1/(1+np.exp(-x))
 
     @staticmethod
     def step(x:np.ndarray, derivative=False) -> np.ndarray:
         # not to self: here heaviside is a sign() function with a special case for zero
+        if derivative:
+            return MLPClassifier.sigmoid(x) # use sigmoid to fake a derivative here
         return np.heaviside(x, 1.0 if not derivative else 0.0)
     
     def train(self, domain_dataset:Dataset, args:argparse.Namespace):
 
         self._config_threads(args)
 
-        etta = 0.02
+        etta = DEFAULT_INITIAL_ETTA
+        alpha_momentum = args.momentum
         params = domain_dataset.param_mat
         reference = domain_dataset.ref_mat
 
         print('MLP training::')
         print(f'classes:{len(domain_dataset.classes)} instances:{len(domain_dataset.instances)}')
-        print(f'params:{params.shape} references:{reference.shape}')
+        print(f'params:{params.shape} references:{reference.shape} batch_size:{args.batch_size}')
 
         dp_avg_cost = []
+        dp_misclassify_count = []
     
+        print(f"Go.")
         for i in range(args.max_epochs):
-            print(f"Epoch #{i}: start")
-            # source = domain_dataset.scrambled_view(PartitioningContext.TRAINING) TODO improve batching
-            source = params # TODO scramble
-            # split the source in sets of "x" batches
-            batches = [source[x:x+args.batch_size,:] for x in range(0, len(source), args.batch_size)] if args.batch_size != -1 else [source]
-            refs = [reference[x:x+args.batch_size,:] for x in range(0, len(source), args.batch_size)] if args.batch_size != -1 else [reference]
+            try:
+                #scramble params and reference matrices the same way
+                assert len(params) == len(reference)
+                perm = np.random.permutation(len(params))
+                params = params[perm] # this will create copies but keeps the original matrices
+                reference = reference[perm] # ditto
 
-            for batchnum, batch in enumerate(batches):
-                print(f"Batch #{batchnum}")
-                ref = refs[batchnum]
-                inputs = []
-                activations = []
-                outputs = []
-                deltas = []
+                # split the source in sets of "x" batches
+                batches = [params[x:x+args.batch_size,:] for x in range(0, len(params), args.batch_size)] if args.batch_size != -1 else [params]
+                refs = [reference[x:x+args.batch_size,:] for x in range(0, len(reference), args.batch_size)] if args.batch_size != -1 else [reference]
+
+                epoch_misclassify_count_accum = []
+                epoch_cost_accum = []
+                momentum_prev = None
+
+                batch:np.ndarray
+                for batchnum, batch in enumerate(batches):
+                    #print(f"Batch #{batchnum}, size {batchsize}")
+                    ref = refs[batchnum]
+                    ref_hit = np.greater(ref, 0.5) # TODO change to astype(bool) or something?
+                    inputs = []
+                    activations = []
+                    outputs = []
+                    deltas = []
 
 
-                # first, feed-forward
-                for layeridx, layer in enumerate(self._layers):
-                    print(f"FF layer {layeridx}")
-                    layer_input = outputs[-1] if outputs else batch
-                    if layer_input.shape[1] == layer.weights.shape[0]-1:
-                        # bias missing in params
-                        layer_input = np.concatenate((layer_input, np.ones((layer_input.shape[0],1,),),), 1)
-                    print(f"layer_input:{layer_input.shape} weights:{layer.weights.shape}")
-                    inputs.append(layer_input)
-                    activation = np.matmul(layer_input, layer.weights)
-                    activations.append(activation)
-                    output = self._activation(activation)
-                    outputs.append(output)
-                    if layer == self._layers[-1]:
-                        # output layer, calc delta on last step                    
-                        err = output - ref
-                        err_sq = 0.5 * np.square(err)
-                        cost = np.sum(err_sq, 0) # cost per class
-                        avg_cost = np.average(cost)
-                        dp_avg_cost.append(avg_cost)
-                        print(f'last_layer: layer_input:{layer_input.shape} cost:{cost}:avg={avg_cost}')
-                        delta = (err)*output*(1.0-output) # assuming sigmoid activation
-                        deltas.append(delta)
-                        print(f'last_layer: w:{layer.weights.shape} etta:{etta} delta:{delta.shape}')
+                    # first, feed-forward
+                    for layeridx, layer in enumerate(self._layers):
+                        #print(f"FF layer {layeridx}")
+                        layer_input = outputs[-1] if outputs else batch
+                        if layer_input.shape[1] == layer.weights.shape[0]-1:
+                            # bias missing in params
+                            layer_input = np.concatenate((layer_input, np.ones((layer_input.shape[0],1,),),), 1)
+                        #print(f"layer_input:{layer_input.shape} weights:{layer.weights.shape}")
+                        inputs.append(layer_input)
+                        activation = np.matmul(layer_input, layer.weights)
+                        activations.append(activation)
+                        output = self._activation(activation)
+                        outputs.append(output)
+                        if layer == self._layers[-1]:
+                            # output layer, calc hit rate and delta on last step                    
+                            # first, hit rate
+                            output_hit = np.greater(output, 0.5)
+                            misses = ref_hit^output_hit
+                            sum_misses = np.sum(misses)
+                            epoch_misclassify_count_accum.append(sum_misses)
+                            # then, error -> loss -> cost
+                            err = output - ref
+                            err_sq = 0.5 * np.square(err)
+                            losses = np.sum(err_sq, 1)/layer_input.shape[1] # cost per inst
+                            #print(losses)
+                            cost = np.sum(losses)
+                            epoch_cost_accum.append(cost)
+                            #print(f"calculating delta {layeridx} (output layer)")
+                            #print(f'last_layer: layer_input:{layer_input.shape} cost:{cost}:avg={cost}')
+                            delta = err*self._activation(output, True) # assuming sigmoid activation
+                            deltas.append(delta)
+                            #print(f'last_layer: w:{layer.weights.shape} etta:{etta} delta:{delta.shape}')
+                        
+                    # calculate other deltas backwards
+                    for layeridx, layer in reversed(list(enumerate(self._layers[:-1]))):
+                        #print(f"calculating delta {layeridx}")
+                        delta_next = deltas[0]
+                        if len(deltas) != 1:
+                            delta_next = delta_next[:,:-1] # not an output delta, discard bias column
+                        this_output = outputs[layeridx]
+                        this_output = np.concatenate((this_output, np.ones((this_output.shape[0],1,),),), 1)
+                        weights_n_t = self._layers[layeridx+1].weights.transpose()
+                        #print(f"delta_next:{delta_next.shape} this_output:{this_output.shape} weights_n_t:{weights_n_t.shape}")
+                        delta = np.matmul(delta_next, weights_n_t)*self._activation(this_output, True)
+                        #print(f"delta:{delta.shape}")
+                        deltas.insert(0, delta) # put first
+
+                    assert len(inputs) == len(outputs) == len(deltas)    
                     
-                # calculate other deltas backwards
-                for layeridx, layer in reversed(list(enumerate(self._layers[:-1]))):
-                    print(f"calculating delta {layeridx}")
-                    delta_next = deltas[0]
-                    if len(deltas) != 1:
-                        delta_next = delta_next[:,:-1] # not an output delta, discard bias column
-                    this_output = outputs[layeridx]
-                    this_output = np.concatenate((this_output, np.ones((this_output.shape[0],1,),),), 1)
-                    weights_n_t = self._layers[layeridx+1].weights.transpose()
-                    print(f"delta_next:{delta_next.shape} this_output:{this_output.shape} weights_n_t:{weights_n_t.shape}")
-                    delta = np.matmul(delta_next, weights_n_t)*(this_output*(1.0-this_output)) # assuming sigmoid activation
-                    print(f"delta:{delta.shape}")
-                    deltas.insert(0, delta) # put first
+                    # now backpropagate
+                    if not args.skip_dry_run:
+                        new_momentum = []
+                        for layeridx, layer in enumerate(self._layers):
+                            gradient = np.matmul(inputs[layeridx].transpose(), deltas[layeridx])
+                            if False:
+                                print(f"adjusting {layeridx}")
+                                print("inputs",inputs[layeridx].shape)
+                                print("deltas",deltas[layeridx].shape)
+                                print("weights",layer.weights.shape)
+                                print("gradient",gradient.shape)
+                            if gradient.shape[1] == layer.weights.shape[1]+1:
+                                gradient = gradient[:,:-1] # TODO discard bias gradient? is this correct?
+                            change = etta * gradient
+                            if momentum_prev:
+                                change += alpha_momentum*momentum_prev[layeridx]
+                            new_momentum.append(change)
+                            layer.weights -= change
+                    momentum_prev = new_momentum
 
-                assert len(inputs) == len(outputs) == len(deltas)    
+                    dump_batch_data = False
+                    if dump_batch_data:
+                        print("BATCH", batch)
+                        print("WEIGHTS", layer.weights)
+                        print("ACTIVATION", activation)
+                        print("OUTPUT", output)
+                        print("REF", ref)
+                        print("ERROR", err)
+                        print("ERRORSQ", err_sq)
+                        print("COST", cost)
+                        print("DELTA", delta)
+                        print("LAST GRADIENT", gradient)
                 
-                # now backpropagate
-                for layeridx, layer in enumerate(self._layers):
-                    print(f"adjusting {layeridx}")
-                    print("inputs",inputs[layeridx].shape)
-                    print("deltas",deltas[layeridx].shape)
-                    print("weights",layer.weights.shape)
-                    gradient = np.matmul(deltas[layeridx].transpose(), inputs[layeridx]).transpose()
-                    #if gradient.shape[1] == layer.weights.shape[1]+1:
-                    #    gradient = gradient[:,:-1] # TODO discard bias gradient? is this correct?
-                    layer.weights -= etta * gradient
-                
-
-                err_accum = np.average(cost) 
+                # all batches done, account for the epoch:
+                sum_misses = np.sum(epoch_misclassify_count_accum)
+                dp_misclassify_count.append(sum_misses)
+                cost = np.average(epoch_cost_accum)
+                dp_avg_cost.append(cost)
                 #print(weights.shape, outputs_float.shape, ref.shape, err.shape, err_squared.shape, learn.shape)
                 # print(excitation)
-                print(f"Epoch #{i}: end, err_accum = {err_accum}")
-                if err_accum == 0.0:
+                print(f"Epoch #{i}: end, cost={cost}, sum_misses={sum_misses}")
+                if cost < 0.001:
                     break
-                
-                # PRINT ALL (help debug single layer, single batch)
-                print("BATCH", batch)
-                print("OUTPUTS", outputs)
-                print("WEIGHTS", layer.weights)
-                print("REF", ref)
-                print("DELTAS", deltas)
-                print("LAST GRADIENT", gradient)
-                print("ERROR", err)
+            except KeyboardInterrupt:
+                print('Trainign interrupted')
                 break
+               
         
         if args.plot:
-            plt.plot(list(range(len(dp_avg_cost))), dp_avg_cost)
+            fig, axis = plt.subplots(2,1)
+            plt.subplots_adjust(hspace = 0.4)
+            axis[0].set_title("Average cost")
+            axis[0].plot(list(range(len(dp_avg_cost))), dp_avg_cost, c='purple')
+            axis[1].set_title("Misclassification count")
+            axis[1].plot(list(range(len(dp_misclassify_count))), dp_misclassify_count, c='red')
             plt.show()
 
     def classify_single(self, single):
@@ -715,6 +808,24 @@ class MLPClassifier:
             params = np.concatenate((params, np.ones((params.shape[0],1,),),), 1)
         return np.matmul(params, w)
 
+    def save(self, fname):
+        weights = [l.weights for l in self._layers]
+        np.savez_compressed(fname, *weights)
+
+    def load(self, fname):
+        loaded = np.load(fname)
+        print(type(loaded))
+        d = dict(loaded)
+        for i, (k,v) in enumerate(d.items()):
+            print(f"Loaded array named '{k}' into layer {i}")
+            layer = self._layers[i]
+            prev_shape = layer.weights.shape
+            layer.weights = v
+            curr_shape = layer.weights.shape
+            assert prev_shape == curr_shape
+            
+        
+        
 
 
 
@@ -729,7 +840,7 @@ class MLPClassifier:
 
 import sys
 from PyQt5.QtCore import Qt, QPoint
-from PyQt5.QtWidgets import QMainWindow, QApplication
+from PyQt5.QtWidgets import QMainWindow, QApplication, QFileDialog
 from PyQt5.QtGui import QImage, QPainter, QPen, QKeyEvent, QFont
 
 
@@ -745,7 +856,7 @@ class DrawingTool(QMainWindow):
         self.classifier = classifier
         self.drawing = False
         self.lastPoint = QPoint()
-        self.image = QImage(img_dims[0], img_dims[1], QImage.Format.Format_Grayscale8)
+        self.image:QImage = QImage(img_dims[0], img_dims[1], QImage.Format.Format_Grayscale8)
         self.image.fill(Qt.black)
         self.scale = 20
         self.bottom_h = 20
@@ -760,6 +871,27 @@ class DrawingTool(QMainWindow):
             self.image.fill(Qt.black)
             self.reclassify()
             self.update()
+            return
+        elif a0.text().lower() == 'l':
+            fname = QFileDialog.getOpenFileName(self, "Open an image")
+            if not fname:
+                return
+            loaded = QImage(fname[0])
+            self.image = loaded.scaled(self.image.width(), self.image.height())
+            self.image.convertTo(QImage.Format.Format_Grayscale8)
+            self.reclassify()
+            self.update()
+            return
+        elif a0.text().lower() == 'r':
+            fname = QFileDialog.getOpenFileName(self, "Open an image")
+            if not fname:
+                return
+            loaded = QImage(fname[0])
+            self.image = loaded.scaled(self.image.width(), self.image.height())
+            self.image.convertTo(QImage.Format.Format_Grayscale8)
+            self.reclassify()
+            self.update()
+            return
         return super().keyPressEvent(a0)
 
     def paintEvent(self, event):
@@ -774,7 +906,7 @@ class DrawingTool(QMainWindow):
         painter.drawText(txtpoint, self.caption)
         if self.draw_instructions:
             painter.setPen(Qt.white)
-            painter.drawText(self.rect(), int(Qt.AlignmentFlag.AlignVCenter) + int(Qt.AlignmentFlag.AlignHCenter), "Draw a number with the mouse")
+            painter.drawText(self.rect(), int(Qt.AlignmentFlag.AlignVCenter) + int(Qt.AlignmentFlag.AlignHCenter), "Draw a number with the mouse\npress 'l' to open an image\npress 'r' to load a random object from the dataset")
 
 
     def mousePressEvent(self, event):
@@ -845,9 +977,13 @@ def get_arg_parser():
     parser.add_argument('--batch-size', '-b', help='number of epoch instances to train in a batch', nargs='?', type=int, default=DEFAULT_TRAINING_BATCH_SIZE)
     parser.add_argument('--num-procs', '-j', help='number of processes used for training', nargs='?', type=int, default=DEFAULT_TRAINING_NUM_PROCS)
     parser.add_argument('--error-threshold', '-t', help='Error level to consider convergence', nargs='?', type=float, default=DEFAULT_ERROR_THRESHOLD)
+    parser.add_argument('--momentum', '-m', help=f'Training momentum (default is {DEFAULT_MOMENTUM})', nargs='?', type=float, default=DEFAULT_MOMENTUM)
     parser.add_argument('--skip-dry-run', '-s', help='Skip making epoch #0 a dry-run', action='store_true')
     parser.add_argument('--plot', '-p', help='Show plots after training', action='store_true')
     parser.add_argument('--draw', '-d', help='Launch drawing tool to test classifier', action='store_true')
+    parser.add_argument('--reference', '-r', help='Use reference classifier', action='store_true')
+    parser.add_argument('--save', '-S', help='Save model to file aft3er training', nargs='?', type=str)
+    parser.add_argument('--load', '-L', help='Load model from file aft3er training', nargs='?', type=str)
     return parser
 
 def get_datasource(args):
@@ -867,11 +1003,22 @@ def main():
 
     datasource = get_datasource(args)
     dataset = Dataset(datasource)
-    classifier = MLPClassifier(dataset, args)
+    classifier = (MLPClassifier if not args.reference else SciKitLearnMLPClassifier)(dataset, args)
     print(classifier)
 
-    print("Starting training")
-    classifier.train(dataset, args)
+    assert not (args.save and args.load)
+
+    if args.load:
+        print("Loading training")
+        classifier.load(args.load)
+    else:
+        print("Starting training")
+        classifier.train(dataset, args)
+
+
+    if args.save:
+        print(f"Saving model to {args.save}")
+        classifier.save(args.save)
 
     #print("Final classification...")
     #print(classifier.classify(dataset))

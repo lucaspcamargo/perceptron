@@ -1,3 +1,5 @@
 numpy
 matplotlib
 pyqt
+# for reference
+scikit-learn
