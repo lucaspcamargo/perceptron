@@ -568,7 +568,14 @@ class SciKitLearnMLPClassifier:
             verbose=True,
             max_iter=int(args.max_epochs),
             learning_rate_init = DEFAULT_INITIAL_ETTA,
-            learning_rate='constant'
+            learning_rate='constant',
+            
+            # ::::::TEST::::
+            # TODO make this a config
+            # make this work for MLP as well
+            early_stopping=True,
+            validation_fraction=0.1,
+            n_iter_no_change=100
         )
         
 
