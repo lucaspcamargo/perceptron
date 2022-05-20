@@ -15,11 +15,11 @@ in a variety of configurations.
         - Calculate the weighted inputs to all perceptrons on a layer at once, and then sum them up for every perceptron; CHECK
         - Apply activation function for the entire result using numpy stuff. CHECK
         - Calculate error using numpy. CHECK
-        - Implement some actual batch handling.
-        - Make all process arguments work.
+        - Implement some actual batch handling. CHECK
+        - Make all process arguments work. CHECK
     - Do MLP right the first time, taking advantage of the above; CHECK(?)
     - TODO review math
-    - Allow storage of arbitrary per-epoch and per-batch stats, and plotting them;
+    - Allow storage of arbitrary per-epoch and per-batch stats, and plotting them; - DOING
     - Support different operations;
         - Classifier training and network save to file; - CHECK
         - Classifier load from file and classify dataset; - CHECK
@@ -778,7 +778,7 @@ class MLPClassifier:
                 if cost < 0.001:
                     break
             except KeyboardInterrupt:
-                print('Trainign interrupted')
+                print('Training interrupted')
                 break
                
         
